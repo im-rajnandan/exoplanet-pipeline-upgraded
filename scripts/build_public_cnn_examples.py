@@ -101,6 +101,68 @@ def _sector_from_row(row: pd.Series) -> int | None:
     return int(digits) if digits else None
 
 
+def _process_single_row(
+    row_tuple,
+    args,
+    config,
+    output_dir,
+    lightcurve_dir,
+) -> list[dict[str, Any]]:
+    row_idx, row = row_tuple
+    tic = _finite_float(row.get("tic_id"))
+    canonical_label = _optional_text(row.get("canonical_label"))
+    binary_label = _optional_text(row.get("binary_label"))
+    if not np.isfinite(tic) or (canonical_label is None and binary_label is None):
+        return []
+    tic_id = int(tic)
+    paths = _find_cached_lightcurves(tic_id, lightcurve_dir)
+    results = []
+    if not paths and args.download_missing:
+        try:
+            paths = search_and_download_tess_lc(tic_id, sector=_sector_from_row(row), download_dir=lightcurve_dir)
+        except Exception as exc:
+            return [{"tic_id": tic_id, "status": "download_failed", "error": repr(exc)}]
+    if not paths:
+        return [{"tic_id": tic_id, "status": "missing_lightcurve"}]
+
+    for path in paths[: args.max_lightcurves_per_target]:
+        raw = load_tess_fits(path)
+        if raw.status != "RAW_LOADED":
+            results.append({"tic_id": tic_id, "fits_path": str(path), "status": raw.status, "error": raw.error})
+            continue
+        cand = _candidate_from_public_row(row, raw, candidate_id=tic_id)
+        if cand is None:
+            results.append({"tic_id": tic_id, "fits_path": str(path), "status": "missing_ephemeris"})
+            continue
+        try:
+            clean = preprocess_raw_lightcurve(raw, config)
+            fit = refine_candidate_parameters(clean, cand, n_bootstrap=args.n_bootstrap)
+            vet = extract_vetting_features(clean, cand, fit)
+            cls = classify_candidate_rule_based(cand, fit, vet)
+            views = build_cnn_candidate_views(clean, cand, fit, vet)
+            views.metadata.update({
+                "tic_id": tic_id,
+                "sector": raw.sector,
+                "fits_path": str(path),
+                "source": row.get("source", ""),
+                "canonical_label": canonical_label,
+                "binary_label": binary_label,
+                "class_predicted_class": cls.predicted_class,
+                "fit_snr": fit.snr,
+                "vet_secondary_sigma": vet.secondary_sigma,
+                "vet_odd_even_sigma": vet.odd_even_sigma,
+                "vet_centroid_shift_sigma": vet.centroid_shift_sigma,
+                "vet_crowding_risk": vet.crowding_risk,
+                "vet_data_quality_score": vet.data_quality_score,
+            })
+            example_path = output_dir / f"tic_{tic_id}_cand_{row_idx + 1:06d}.npz"
+            save_cnn_example_npz(views, example_path, canonical_label=canonical_label, binary_label=binary_label)
+            results.append({"tic_id": tic_id, "fits_path": str(path), "example_path": str(example_path), "status": "ok"})
+        except Exception as exc:
+            results.append({"tic_id": tic_id, "fits_path": str(path), "status": "example_failed", "error": repr(exc)})
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build CNN examples from official public TOI metadata and MAST TESS light curves.")
     parser.add_argument("metadata_csv", help="Normalized metadata CSV, or raw CSV with --source")
@@ -112,6 +174,7 @@ def main() -> None:
     parser.add_argument("--max-lightcurves-per-target", type=int, default=1)
     parser.add_argument("--n-bootstrap", type=int, default=50)
     parser.add_argument("--detrend-method", default="rolling_median", choices=["rolling_median", "wotan_biweight", "none"])
+    parser.add_argument("--n-workers", type=int, default=16, help="Number of concurrent download/processing threads")
     args = parser.parse_args()
 
     metadata = read_public_metadata(args.metadata_csv, args.source) if args.source else pd.read_csv(args.metadata_csv)
@@ -127,60 +190,27 @@ def main() -> None:
     manifest_rows: list[dict[str, Any]] = []
     n_written = 0
 
-    for _, row in metadata.iterrows():
-        tic = _finite_float(row.get("tic_id"))
-        canonical_label = _optional_text(row.get("canonical_label"))
-        binary_label = _optional_text(row.get("binary_label"))
-        if not np.isfinite(tic) or (canonical_label is None and binary_label is None):
-            continue
-        tic_id = int(tic)
-        paths = _find_cached_lightcurves(tic_id, lightcurve_dir)
-        if not paths and args.download_missing:
-            try:
-                paths = search_and_download_tess_lc(tic_id, sector=_sector_from_row(row), download_dir=lightcurve_dir)
-            except Exception as exc:
-                manifest_rows.append({"tic_id": tic_id, "status": "download_failed", "error": repr(exc)})
-                continue
-        if not paths:
-            manifest_rows.append({"tic_id": tic_id, "status": "missing_lightcurve"})
-            continue
+    import concurrent.futures
+    row_list = list(metadata.iterrows())
+    print(f"Starting parallel download and preprocessing of {len(row_list)} targets with {args.n_workers} threads...", flush=True)
 
-        for path in paths[: args.max_lightcurves_per_target]:
-            raw = load_tess_fits(path)
-            if raw.status != "RAW_LOADED":
-                manifest_rows.append({"tic_id": tic_id, "fits_path": str(path), "status": raw.status, "error": raw.error})
-                continue
-            cand = _candidate_from_public_row(row, raw, candidate_id=n_written + 1)
-            if cand is None:
-                manifest_rows.append({"tic_id": tic_id, "fits_path": str(path), "status": "missing_ephemeris"})
-                continue
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.n_workers) as executor:
+        future_to_row = {
+            executor.submit(_process_single_row, item, args, config, output_dir, lightcurve_dir): item
+            for item in row_list
+        }
+        for i, fut in enumerate(concurrent.futures.as_completed(future_to_row)):
+            item = future_to_row[fut]
             try:
-                clean = preprocess_raw_lightcurve(raw, config)
-                fit = refine_candidate_parameters(clean, cand, n_bootstrap=args.n_bootstrap)
-                vet = extract_vetting_features(clean, cand, fit)
-                cls = classify_candidate_rule_based(cand, fit, vet)
-                views = build_cnn_candidate_views(clean, cand, fit, vet)
-                views.metadata.update({
-                    "tic_id": tic_id,
-                    "sector": raw.sector,
-                    "fits_path": str(path),
-                    "source": row.get("source", ""),
-                    "canonical_label": canonical_label,
-                    "binary_label": binary_label,
-                    "class_predicted_class": cls.predicted_class,
-                    "fit_snr": fit.snr,
-                    "vet_secondary_sigma": vet.secondary_sigma,
-                    "vet_odd_even_sigma": vet.odd_even_sigma,
-                    "vet_centroid_shift_sigma": vet.centroid_shift_sigma,
-                    "vet_crowding_risk": vet.crowding_risk,
-                    "vet_data_quality_score": vet.data_quality_score,
-                })
-                example_path = output_dir / f"tic_{tic_id}_cand_{n_written + 1:06d}.npz"
-                save_cnn_example_npz(views, example_path, canonical_label=canonical_label, binary_label=binary_label)
-                n_written += 1
-                manifest_rows.append({"tic_id": tic_id, "fits_path": str(path), "example_path": str(example_path), "status": "ok"})
+                results = fut.result()
+                for res in results:
+                    manifest_rows.append(res)
+                    if res["status"] == "ok":
+                        n_written += 1
             except Exception as exc:
-                manifest_rows.append({"tic_id": tic_id, "fits_path": str(path), "status": "example_failed", "error": repr(exc)})
+                print(f"Error processing row {item[0]}: {exc}", flush=True)
+            if (i + 1) % 10 == 0 or (i + 1) == len(row_list):
+                print(f"  [{i+1}/{len(row_list)}] targets processed (examples written: {n_written})", flush=True)
 
     manifest = pd.DataFrame(manifest_rows)
     manifest_path = output_dir / "cnn_example_manifest.csv"
