@@ -1,0 +1,65 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  base:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Check installed dependencies
+        run: python -m pip check
+
+      - name: Compile Python files
+        run: PYTHONPYCACHEPREFIX=.context/pycache python -m compileall -q src scripts tests
+
+      - name: Run tests
+        env:
+          MPLBACKEND: Agg
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m pytest
+
+  deep-smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package with deep extra
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,deep]"
+
+      - name: Check installed dependencies
+        run: python -m pip check
+
+      - name: Run CNN deep smoke tests
+        env:
+          MPLBACKEND: Agg
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m pytest tests/test_cnn_deep.py
