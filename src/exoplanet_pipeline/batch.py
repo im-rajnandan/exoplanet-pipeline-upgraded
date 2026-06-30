@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Iterable, Any
 import hashlib
 import json
+import multiprocessing as mp
+import queue
 import time
 import traceback
 
@@ -158,6 +160,112 @@ def _process_single_target_raw(
         return key, "FAILED", None, row, f"{exc}\n{tb}"
 
 
+def _worker_child_entry(result_queue: Any, worker: Any, args: tuple[Any, ...]) -> None:
+    try:
+        result_queue.put(("result", worker(*args)))
+    except BaseException:
+        result_queue.put(("error", traceback.format_exc()))
+
+
+def _process_context() -> mp.context.BaseContext:
+    return mp.get_context()
+
+
+def _failed_child_result(task: dict[str, Any], error: str) -> tuple[str, str, pd.DataFrame | None, dict, str | None]:
+    key = task["key"]
+    row = _target_summary_row(key, error=error, source=task["source"])
+    with open(task["summary_path"], "w", encoding="utf-8") as f:
+        json.dump(row, f, indent=2, default=_json_default)
+    return key, "FAILED", None, row, error
+
+
+def _terminate_process(process: Any) -> None:
+    if not process.is_alive():
+        return
+    process.terminate()
+    process.join(timeout=1.0)
+    if process.is_alive() and hasattr(process, "kill"):
+        process.kill()
+        process.join(timeout=1.0)
+
+
+def _iter_process_results(
+    tasks: list[dict[str, Any]],
+    worker: Any,
+    *,
+    n_workers: int,
+    timeout_seconds: float | None,
+    stop_on_failure: bool,
+):
+    """Run target tasks in child processes with real per-target timeouts."""
+    ctx = _process_context()
+    pending = list(tasks)
+    running: dict[int, dict[str, Any]] = {}
+
+    def start(task: dict[str, Any]) -> None:
+        result_queue = ctx.Queue(maxsize=1)
+        process = ctx.Process(target=_worker_child_entry, args=(result_queue, worker, task["args"]))
+        process.start()
+        running[id(process)] = {
+            "task": task,
+            "process": process,
+            "queue": result_queue,
+            "started": time.monotonic(),
+        }
+
+    try:
+        while pending or running:
+            while pending and len(running) < max(1, int(n_workers)):
+                start(pending.pop(0))
+
+            emitted = False
+            for token, state in list(running.items()):
+                task = state["task"]
+                process = state["process"]
+                result_queue = state["queue"]
+
+                try:
+                    kind, payload = result_queue.get_nowait()
+                except queue.Empty:
+                    if timeout_seconds is not None and time.monotonic() - state["started"] > timeout_seconds:
+                        _terminate_process(process)
+                        result = _failed_child_result(
+                            task,
+                            f"Target {task['key']} exceeded timeout of {timeout_seconds} seconds.",
+                        )
+                    elif not process.is_alive():
+                        process.join(timeout=0.1)
+                        result = _failed_child_result(
+                            task,
+                            f"Worker exited without returning a result. exitcode={process.exitcode}",
+                        )
+                    else:
+                        continue
+                else:
+                    process.join(timeout=0.1)
+                    if kind == "result":
+                        result = payload
+                    else:
+                        result = _failed_child_result(task, payload)
+
+                try:
+                    result_queue.close()
+                except Exception:
+                    pass
+                running.pop(token, None)
+                emitted = True
+                yield task, result
+                if stop_on_failure and result[1] == "FAILED":
+                    pending.clear()
+                    return
+
+            if not emitted:
+                time.sleep(0.05)
+    finally:
+        for state in running.values():
+            _terminate_process(state["process"])
+
+
 def run_raw_lightcurve_batch(
     raw_lightcurves: Iterable[RawLightCurve],
     model_bundle: dict | None = None,
@@ -223,44 +331,35 @@ def run_raw_lightcurve_batch(
                 _write_running_outputs(output_dir, all_rows, target_rows, failure_rows)
     # 3. Parallel execution with timeouts
     else:
-        import concurrent.futures
-        with concurrent.futures.ProcessPoolExecutor(max_workers=batch_config.n_workers) as executor:
-            futures = {}
-            for raw, key, per_target_path, summary_path in active_items:
-                fut = executor.submit(
-                    _process_single_target_raw,
-                    raw, key, model_bundle, cnn_bundle, pipeline_config, batch_config, per_target_path, summary_path
-                )
-                futures[fut] = (key, raw, summary_path)
-
-            for fut in concurrent.futures.as_completed(futures):
-                key, raw, summary_path = futures[fut]
-                try:
-                    _, status, df, row, err_str = fut.result(timeout=batch_config.timeout_seconds)
-                except concurrent.futures.TimeoutError:
-                    status = "FAILED"
-                    df = None
-                    err_str = f"Target {key} exceeded timeout of {batch_config.timeout_seconds} seconds."
-                    row = _target_summary_row(key, error="TIMEOUT", source="raw_object")
-                    with open(summary_path, "w", encoding="utf-8") as f:
-                        json.dump(row, f, indent=2, default=_json_default)
-                except Exception as exc:
-                    status = "FAILED"
-                    df = None
-                    err_str = str(exc)
-                    row = _target_summary_row(key, error=str(exc), source="raw_object")
-                    with open(summary_path, "w", encoding="utf-8") as f:
-                        json.dump(row, f, indent=2, default=_json_default)
-
-                if df is not None and not df.empty:
-                    all_rows.append(df)
-                target_rows.append(row)
-                if status == "FAILED":
-                    failure_rows.append({"target_key": key, "error": err_str})
-                    if not batch_config.continue_on_error:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        raise ValueError(f"Task failed: {err_str}")
-                _write_running_outputs(output_dir, all_rows, target_rows, failure_rows)
+        tasks = [
+            {
+                "key": key,
+                "source": "raw_object",
+                "summary_path": summary_path,
+                "args": (raw, key, model_bundle, cnn_bundle, pipeline_config, batch_config, per_target_path, summary_path),
+            }
+            for raw, key, per_target_path, summary_path in active_items
+        ]
+        for n_completed, (_, result) in enumerate(
+            _iter_process_results(
+                tasks,
+                _process_single_target_raw,
+                n_workers=batch_config.n_workers,
+                timeout_seconds=batch_config.timeout_seconds,
+                stop_on_failure=not batch_config.continue_on_error,
+            ),
+            1,
+        ):
+            key, status, df, row, err_str = result
+            print(f"[{n_completed}/{len(active_items)}] Finished target {key} with status: {status}", flush=True)
+            if df is not None and not df.empty:
+                all_rows.append(df)
+            target_rows.append(row)
+            if status == "FAILED":
+                failure_rows.append({"target_key": key, "error": err_str})
+                if not batch_config.continue_on_error:
+                    raise ValueError(f"Task failed: {err_str}")
+            _write_running_outputs(output_dir, all_rows, target_rows, failure_rows)
 
     return _write_running_outputs(output_dir, all_rows, target_rows, failure_rows, final=batch_config.make_final_catalog)
 
@@ -360,47 +459,37 @@ def run_fits_file_batch(
                 _write_running_outputs(output_dir, all_rows, target_rows, failure_rows)
     # 3. Parallel execution with timeouts
     else:
-        import concurrent.futures
-        with concurrent.futures.ProcessPoolExecutor(max_workers=batch_config.n_workers) as executor:
-            futures = {}
-            for path, key, per_target_path, summary_path in active_items:
-                fut = executor.submit(
-                    _process_single_target_fits,
-                    path, key, model_bundle, cnn_bundle, pipeline_config, batch_config, per_target_path, summary_path
-                )
-                futures[fut] = (key, path, summary_path)
-
-            n_completed = 0
-            for fut in concurrent.futures.as_completed(futures):
-                key, path, summary_path = futures[fut]
-                n_completed += 1
-                try:
-                    _, status, df, row, err_str = fut.result(timeout=batch_config.timeout_seconds)
-                except concurrent.futures.TimeoutError:
-                    status = "FAILED"
-                    df = None
-                    err_str = f"Target {key} exceeded timeout of {batch_config.timeout_seconds} seconds."
-                    row = _target_summary_row(key, error="TIMEOUT", source=str(path))
-                    with open(summary_path, "w", encoding="utf-8") as f:
-                        json.dump(row, f, indent=2, default=_json_default)
-                except Exception as exc:
-                    status = "FAILED"
-                    df = None
-                    err_str = str(exc)
-                    row = _target_summary_row(key, error=str(exc), source=str(path))
-                    with open(summary_path, "w", encoding="utf-8") as f:
-                        json.dump(row, f, indent=2, default=_json_default)
-
-                print(f"[{n_completed}/{len(active_items)}] Finished target {key} from {path.name} with status: {status}", flush=True)
-                if df is not None and not df.empty:
-                    all_rows.append(df)
-                target_rows.append(row)
-                if status == "FAILED":
-                    failure_rows.append({"target_key": key, "source_file": str(path), "error": err_str})
-                    if not batch_config.continue_on_error:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        raise ValueError(f"Task failed: {err_str}")
-                _write_running_outputs(output_dir, all_rows, target_rows, failure_rows)
+        tasks = [
+            {
+                "key": key,
+                "source": str(path),
+                "source_file": str(path),
+                "summary_path": summary_path,
+                "args": (path, key, model_bundle, cnn_bundle, pipeline_config, batch_config, per_target_path, summary_path),
+            }
+            for path, key, per_target_path, summary_path in active_items
+        ]
+        for n_completed, (task, result) in enumerate(
+            _iter_process_results(
+                tasks,
+                _process_single_target_fits,
+                n_workers=batch_config.n_workers,
+                timeout_seconds=batch_config.timeout_seconds,
+                stop_on_failure=not batch_config.continue_on_error,
+            ),
+            1,
+        ):
+            key, status, df, row, err_str = result
+            path = Path(task["source_file"])
+            print(f"[{n_completed}/{len(active_items)}] Finished target {key} from {path.name} with status: {status}", flush=True)
+            if df is not None and not df.empty:
+                all_rows.append(df)
+            target_rows.append(row)
+            if status == "FAILED":
+                failure_rows.append({"target_key": key, "source_file": str(path), "error": err_str})
+                if not batch_config.continue_on_error:
+                    raise ValueError(f"Task failed: {err_str}")
+            _write_running_outputs(output_dir, all_rows, target_rows, failure_rows)
 
     return _write_running_outputs(output_dir, all_rows, target_rows, failure_rows, final=batch_config.make_final_catalog)
 

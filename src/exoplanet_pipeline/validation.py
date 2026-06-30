@@ -9,6 +9,12 @@ import pandas as pd
 
 from .ml import CANONICAL_CLASSES, normalize_label
 
+DETECTED_STATUS_VALUES = {
+    "DETECTED",
+    "STRONG_DETECTION",
+    "WEAK_DETECTION",
+}
+
 try:
     from sklearn.metrics import (
         accuracy_score,
@@ -64,7 +70,7 @@ def has_detected_signal(df: pd.DataFrame) -> pd.Series:
     """Infer detection flag from candidate catalog columns."""
     if "status" in df.columns:
         st = df["status"].astype(str).str.upper()
-        return st.str.contains("STRONG|WEAK|DETECTED") & ~st.str.contains("NO_DETECTION")
+        return st.isin(DETECTED_STATUS_VALUES)
     if "snr" in df.columns or "local_snr" in df.columns or "fit_snr" in df.columns:
         snr = _safe_float_series(df.get("fit_snr", df.get("local_snr", df.get("snr"))))
         return snr >= 7.0

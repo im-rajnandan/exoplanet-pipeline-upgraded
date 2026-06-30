@@ -15,7 +15,7 @@ from .cnn_views import (
     LOCAL_VIEW_NAMES,
     CNNCandidateViews,
 )
-from .ml import CANONICAL_CLASSES, _apply_physical_guardrails, _renormalize_probs
+from .classification_policy import CANONICAL_CLASSES, finalize_probabilities, renormalize_probs as _renormalize_probs
 
 try:
     import torch
@@ -564,20 +564,13 @@ def predict_cnn_candidate_views(
     cnn_pred = max(probs, key=probs.get)
     cnn_conf = float(probs[cnn_pred])
 
-    final_probs = dict(probs)
-    warnings_here: list[str] = []
-    method = "cnn"
-    if apply_physical_guardrails and catalog_row is not None:
-        final_probs, guard_warnings = _apply_physical_guardrails(final_probs, pd.Series(catalog_row))
-        warnings_here.extend(guard_warnings)
-        method = "cnn_plus_physical_guardrails"
-    final_probs = _renormalize_probs(final_probs)
-    final_pred = max(final_probs, key=final_probs.get)
-    final_conf = float(final_probs[final_pred])
-    if final_conf < 0.45 and final_pred != "NO_SIGNIFICANT_SIGNAL":
-        final_pred = "UNCERTAIN_TRANSIT_LIKE_SIGNAL"
-        final_conf = max(final_conf, final_probs.get(final_pred, 0.0), 0.45)
-        warnings_here.append("low_cnn_margin_downgraded_to_uncertain")
+    final_probs, final_pred, final_conf, warnings_here = finalize_probabilities(
+        probs,
+        row=catalog_row,
+        apply_guardrails=apply_physical_guardrails and catalog_row is not None,
+        low_margin_warning="low_cnn_margin_downgraded_to_uncertain",
+    )
+    method = "cnn_plus_physical_guardrails" if apply_physical_guardrails and catalog_row is not None else "cnn"
 
     out: dict[str, Any] = {
         "cnn_predicted_class": cnn_pred,
@@ -684,8 +677,8 @@ def _make_batch_tensors(global_x, local_x, scalar_x, y_class, y_binary, batch_id
     if augment:
         for i in range(len(batch_idx)):
             g_batch[i, 0] = augment_light_curve_numpy(g_batch[i, 0], phase_shift_bins=4, noise_sigma=0.0005, scale_pct=0.05)
-            for view_idx in range(l_batch.shape[2]):
-                l_batch[i, 0, view_idx] = augment_light_curve_numpy(l_batch[i, 0, view_idx], phase_shift_bins=2, noise_sigma=0.0005, scale_pct=0.05)
+            for view_idx in range(l_batch.shape[1]):
+                l_batch[i, view_idx, 0] = augment_light_curve_numpy(l_batch[i, view_idx, 0], phase_shift_bins=2, noise_sigma=0.0005, scale_pct=0.05)
 
     return {
         "global": torch.as_tensor(g_batch, dtype=torch.float32, device=device),

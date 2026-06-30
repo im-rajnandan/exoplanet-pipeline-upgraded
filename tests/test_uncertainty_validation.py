@@ -8,7 +8,7 @@ from exoplanet_pipeline.synthetic import make_synthetic_transit_lc
 from exoplanet_pipeline.pipeline import run_parts_1_to_5_from_raw
 from exoplanet_pipeline.pipeline_parts_1_to_8 import attach_ai_and_uncertainty
 from exoplanet_pipeline.uncertainty import estimate_candidate_uncertainty, add_uncertainty_columns
-from exoplanet_pipeline.validation import validate_candidate_catalog
+from exoplanet_pipeline.validation import has_detected_signal, validate_candidate_catalog
 import exoplanet_pipeline.injection_recovery as injection_recovery
 from exoplanet_pipeline.injection_recovery import (
     InjectionSpec,
@@ -83,6 +83,11 @@ def test_validation_report_with_labels():
     assert report.classification_metrics["available"] is True
     assert report.classification_metrics["accuracy"] >= 0.75
     assert report.detection_metrics["available"] is True
+
+
+def test_no_strong_detection_status_is_not_detected():
+    df = pd.DataFrame({"status": ["NO_STRONG_DETECTION", "NO_DETECTION", "WEAK_DETECTION", "STRONG_DETECTION"]})
+    assert has_detected_signal(df).tolist() == [False, False, True, True]
 
 
 def test_small_injection_recovery_grid_runs():

@@ -1,4 +1,6 @@
 from pathlib import Path
+import time
+
 import pandas as pd
 
 from exoplanet_pipeline.final_catalog import harmonize_candidate_catalog, summarize_final_catalog, validate_final_catalog_schema
@@ -6,6 +8,11 @@ from exoplanet_pipeline.batch import BatchRunConfig, run_raw_lightcurve_batch, r
 from exoplanet_pipeline.config import PipelineConfig
 from exoplanet_pipeline.synthetic import make_synthetic_transit_lc
 from exoplanet_pipeline.final_outputs import generate_submission_package_outputs
+
+
+def _sleeping_worker_for_timeout_test():
+    time.sleep(0.5)
+    return "slow", "OK", pd.DataFrame(), {"target_key": "slow", "status": "OK"}, None
 
 
 def test_harmonize_candidate_catalog_basic():
@@ -89,6 +96,29 @@ def test_small_raw_batch_runs(tmp_path: Path):
     assert (tmp_path / "batch_final_candidate_catalog.csv").exists()
     assert (tmp_path / "batch_target_summary.csv").exists()
     assert (tmp_path / "batch_failure_log.csv").exists()
+
+
+def test_process_runner_enforces_target_timeout(tmp_path: Path):
+    import exoplanet_pipeline.batch as batch_module
+
+    task = {
+        "key": "slow",
+        "source": "unit_test",
+        "summary_path": tmp_path / "slow_summary.json",
+        "args": (),
+    }
+    results = list(batch_module._iter_process_results(
+        [task],
+        _sleeping_worker_for_timeout_test,
+        n_workers=2,
+        timeout_seconds=0.05,
+        stop_on_failure=False,
+    ))
+
+    _, result = results[0]
+    assert result[1] == "FAILED"
+    assert "exceeded timeout" in result[4]
+    assert (tmp_path / "slow_summary.json").exists()
 
 
 def test_empty_fits_batch_writes_empty_outputs(tmp_path: Path):

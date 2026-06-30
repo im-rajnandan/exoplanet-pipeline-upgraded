@@ -9,6 +9,12 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from .classification_policy import (
+    CANONICAL_CLASSES,
+    finalize_probabilities,
+    renormalize_probs as _renormalize_probs,
+)
+
 try:
     import joblib
     from sklearn.base import clone
@@ -30,16 +36,6 @@ except Exception as exc:  # pragma: no cover - handled at runtime for optional d
 else:
     _SKLEARN_IMPORT_ERROR = None
 
-
-CANONICAL_CLASSES: tuple[str, ...] = (
-    "PLANETARY_TRANSIT_CANDIDATE",
-    "ECLIPSING_BINARY",
-    "BLEND_OR_CONTAMINATED_SIGNAL",
-    "STELLAR_VARIABILITY",
-    "INSTRUMENTAL_OR_LOW_QUALITY_SYSTEMATIC",
-    "NO_SIGNIFICANT_SIGNAL",
-    "UNCERTAIN_TRANSIT_LIKE_SIGNAL",
-)
 
 # Numeric feature columns that are expected from the Parts 1-5 catalog.
 # The model can also ingest additional numeric features from a curated dataset.
@@ -604,17 +600,13 @@ def predict_ai_classifier(
             }
             warnings_here.append("blended_ai_with_rule_based_scores")
 
-        if apply_physical_guardrails:
-            probs, guard_warnings = _apply_physical_guardrails(probs, row)
-            warnings_here.extend(guard_warnings)
-
-        probs = _renormalize_probs(probs)
-        pred = max(probs, key=probs.get)
-        conf = probs[pred]
-        if conf < 0.45 and pred != "NO_SIGNIFICANT_SIGNAL":
-            pred = "UNCERTAIN_TRANSIT_LIKE_SIGNAL"
-            conf = max(conf, probs.get(pred, 0.0), 0.45)
-            warnings_here.append("low_ai_margin_downgraded_to_uncertain")
+        probs, pred, conf, policy_warnings = finalize_probabilities(
+            probs,
+            row=row,
+            apply_guardrails=apply_physical_guardrails,
+            low_margin_warning="low_ai_margin_downgraded_to_uncertain",
+        )
+        warnings_here.extend(policy_warnings)
 
         final_probs_rows.append(probs)
         final_pred.append(pred)
@@ -663,69 +655,6 @@ def _rule_scores_from_row(row: pd.Series) -> dict[str, float] | None:
     scores["NO_SIGNIFICANT_SIGNAL"] = 0.0
     scores["UNCERTAIN_TRANSIT_LIKE_SIGNAL"] = max(0.0, 1.0 - max(scores.values())) * 0.25
     return _renormalize_probs(scores)
-
-
-def _apply_physical_guardrails(probs: dict[str, float], row: pd.Series) -> tuple[dict[str, float], list[str]]:
-    warnings_here: list[str] = []
-    p = dict(probs)
-
-    secondary_sigma = _safe_float(row.get("vet_secondary_sigma"))
-    secondary_ratio = _safe_float(row.get("vet_secondary_to_primary_ratio"))
-    odd_even_sigma = _safe_float(row.get("vet_odd_even_sigma"))
-    centroid_sigma = _safe_float(row.get("vet_centroid_shift_sigma"))
-    crowdsap = _safe_float(row.get("vet_crowdsap"))
-    crowding_risk = _safe_float(row.get("vet_crowding_risk"))
-    data_quality = _safe_float(row.get("vet_data_quality_score"))
-    snr = _safe_float(row.get("fit_snr", row.get("snr")))
-
-    if secondary_sigma >= 5.0 and secondary_ratio >= 0.05:
-        p["ECLIPSING_BINARY"] = max(p.get("ECLIPSING_BINARY", 0.0), 0.82)
-        p["PLANETARY_TRANSIT_CANDIDATE"] = min(p.get("PLANETARY_TRANSIT_CANDIDATE", 0.0), 0.18)
-        warnings_here.append("guardrail_strong_secondary_eclipse")
-    elif secondary_sigma >= 5.0:
-        p["ECLIPSING_BINARY"] = max(p.get("ECLIPSING_BINARY", 0.0), 0.60)
-        p["PLANETARY_TRANSIT_CANDIDATE"] = min(p.get("PLANETARY_TRANSIT_CANDIDATE", 0.0), 0.35)
-        warnings_here.append("guardrail_possible_secondary_eclipse")
-    if odd_even_sigma >= 3.0:
-        p["ECLIPSING_BINARY"] = max(p.get("ECLIPSING_BINARY", 0.0), 0.72)
-        p["PLANETARY_TRANSIT_CANDIDATE"] = min(p.get("PLANETARY_TRANSIT_CANDIDATE", 0.0), 0.25)
-        warnings_here.append("guardrail_odd_even_depth_mismatch")
-    if centroid_sigma >= 5.0:
-        p["BLEND_OR_CONTAMINATED_SIGNAL"] = max(p.get("BLEND_OR_CONTAMINATED_SIGNAL", 0.0), 0.82)
-        p["PLANETARY_TRANSIT_CANDIDATE"] = min(p.get("PLANETARY_TRANSIT_CANDIDATE", 0.0), 0.25)
-        warnings_here.append("guardrail_significant_centroid_shift")
-    elif centroid_sigma >= 3.0 and crowding_risk >= 0.25:
-        p["BLEND_OR_CONTAMINATED_SIGNAL"] = max(p.get("BLEND_OR_CONTAMINATED_SIGNAL", 0.0), 0.65)
-        warnings_here.append("guardrail_marginal_centroid_plus_crowding")
-    if (np.isfinite(crowdsap) and crowdsap <= 0.60) or crowding_risk >= 0.40:
-        p["BLEND_OR_CONTAMINATED_SIGNAL"] = max(p.get("BLEND_OR_CONTAMINATED_SIGNAL", 0.0), 0.62)
-        p["PLANETARY_TRANSIT_CANDIDATE"] = min(p.get("PLANETARY_TRANSIT_CANDIDATE", 0.0), 0.38)
-        warnings_here.append("guardrail_low_crowdsap_or_high_crowding")
-    if data_quality <= 0.35:
-        p["INSTRUMENTAL_OR_LOW_QUALITY_SYSTEMATIC"] = max(p.get("INSTRUMENTAL_OR_LOW_QUALITY_SYSTEMATIC", 0.0), 0.70)
-        p["PLANETARY_TRANSIT_CANDIDATE"] = min(p.get("PLANETARY_TRANSIT_CANDIDATE", 0.0), 0.22)
-        warnings_here.append("guardrail_low_data_quality")
-    if snr < 6.0:
-        p["NO_SIGNIFICANT_SIGNAL"] = max(p.get("NO_SIGNIFICANT_SIGNAL", 0.0), 0.55)
-        p["PLANETARY_TRANSIT_CANDIDATE"] = min(p.get("PLANETARY_TRANSIT_CANDIDATE", 0.0), 0.18)
-        warnings_here.append("guardrail_low_snr")
-    return p, warnings_here
-
-
-def _safe_float(x: Any, default: float = np.nan) -> float:
-    try:
-        v = float(x)
-        return v if np.isfinite(v) else default
-    except Exception:
-        return default
-
-
-def _renormalize_probs(probs: dict[str, float]) -> dict[str, float]:
-    clean = {cls: max(0.0, float(probs.get(cls, 0.0))) for cls in CANONICAL_CLASSES}
-    s = sum(clean.values())
-    if s <= 0:
-        return {cls: 1.0 / len(CANONICAL_CLASSES) for cls in CANONICAL_CLASSES}
-    return {cls: v / s for cls, v in clean.items()}
 
 
 def save_model_bundle(model_bundle: dict[str, Any], path: str | Path) -> None:

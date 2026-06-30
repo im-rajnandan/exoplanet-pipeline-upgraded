@@ -7,6 +7,7 @@ torch = pytest.importorskip("torch")
 from exoplanet_pipeline.cnn import (
     CNNModelConfig,
     CNNTrainingExample,
+    _make_batch_tensors,
     create_cnn_model,
     predict_cnn_candidate_views,
     train_cnn_classifier,
@@ -53,6 +54,33 @@ def test_tiny_cnn_training_smoke_cpu():
     result = train_cnn_classifier(examples, config=config, epochs=1, batch_size=2, seed=7)
     assert result.metrics["epochs"] == 1
     assert result.metrics["n_examples"] == 4
+
+
+def test_cnn_augmentation_preserves_validity_masks():
+    global_x = np.zeros((1, 2, 1001), dtype=np.float32)
+    global_x[:, 1, :] = 1.0
+    local_x = np.zeros((1, 6, 2, 401), dtype=np.float32)
+    local_x[:, :, 1, :] = 1.0
+    scalar_x = np.zeros((1, len(CNNModelConfig().scalar_feature_names)), dtype=np.float32)
+    y_class = np.asarray([0], dtype=np.int64)
+    y_binary = np.asarray([1.0], dtype=np.float32)
+
+    tensors = _make_batch_tensors(
+        global_x,
+        local_x,
+        scalar_x,
+        y_class,
+        y_binary,
+        np.asarray([0]),
+        torch,
+        "cpu",
+        augment=True,
+    )
+
+    global_aug = tensors["global"].cpu().numpy()
+    local_aug = tensors["local"].cpu().numpy()
+    assert np.all(global_aug[0, 1, :] == 1.0)
+    assert np.all(local_aug[0, :, 1, :] == 1.0)
 
 
 def test_cnn_guardrails_can_downgrade_high_planet_output():
