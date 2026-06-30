@@ -513,13 +513,17 @@ def predict_cnn_candidate_views(
     *,
     catalog_row: pd.Series | dict[str, Any] | None = None,
     apply_physical_guardrails: bool = True,
-    device: str = "cpu",
+    device: str | None = None,
     mc_samples: int = 50,
 ) -> dict[str, Any]:
     """Return public CNN and final-classifier columns for one candidate."""
     torch, _, F = _require_torch()
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     bundle = load_cnn_bundle(cnn_bundle, map_location=device) if isinstance(cnn_bundle, (str, Path)) else cnn_bundle
     model = bundle["model"]
+    if hasattr(model, "to"):
+        model.to(device)
     config = bundle.get("config") or CNNModelConfig()
     if isinstance(config, dict):
         config = CNNModelConfig.from_dict(config)
