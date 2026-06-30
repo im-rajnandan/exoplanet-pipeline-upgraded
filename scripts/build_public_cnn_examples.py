@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
@@ -76,15 +77,22 @@ def _candidate_from_public_row(row: pd.Series, raw, candidate_id: int) -> Candid
 
 def _find_cached_lightcurves(tic_id: int, lightcurve_dir: Path) -> list[Path]:
     patterns = [
-        f"*{tic_id}*lc.fits*",
         f"*{tic_id:016d}*lc.fits*",
+        f"*{tic_id}*lc.fits*",
         f"*tic{tic_id}*lc.fits*",
         f"*TIC{tic_id}*lc.fits*",
     ]
     paths: list[Path] = []
     for pat in patterns:
         paths.extend(lightcurve_dir.rglob(pat))
-    return sorted(set(paths))
+    return sorted({path for path in paths if _path_matches_tic_id(path, tic_id)})
+
+
+def _path_matches_tic_id(path: Path, tic_id: int) -> bool:
+    name = path.name.lower()
+    if f"{tic_id:016d}" in name:
+        return True
+    return re.search(rf"(?<!\d)(?:tic[_-]?)?{int(tic_id)}(?!\d)", name) is not None
 
 
 def _sector_from_row(row: pd.Series) -> int | None:

@@ -52,7 +52,8 @@ Train or demo the Part 6 AI classifier:
 
 ```bash
 python3 scripts/run_part6_synthetic_ai_demo.py
-python3 scripts/train_ai_classifier_from_catalog.py curated_labeled_catalog.csv --label-col label --output-dir outputs_part6_ai
+python3 scripts/build_labeled_candidate_catalog.py curated_labels.csv --label-col label --lightcurve-dir data/public/lightcurves --output-dir outputs_labeled_candidates
+python3 scripts/train_ai_classifier_from_catalog.py outputs_labeled_candidates/labeled_candidate_features.csv --label-col label --output-dir outputs_part6_ai
 python3 scripts/predict_ai_classifier_catalog.py outputs_part6_ai/part6_ai_classifier.joblib candidate_catalog.csv --output-csv outputs_part6_ai/science_predictions.csv
 ```
 
@@ -76,7 +77,7 @@ python3 scripts/train_cnn_classifier.py data/public/cnn_examples --output-dir ou
 python3 scripts/predict_cnn_examples.py outputs_cnn data/public/cnn_examples --output-csv outputs_cnn/cnn_predictions.csv --device cuda
 ```
 
-See [docs/public_cnn_training.md](docs/public_cnn_training.md) for the public-data-only Colab/Kaggle workflow and source notes.
+See [docs/kaggle_real_run.md](docs/kaggle_real_run.md) for the real-data Kaggle runbook, and [docs/public_cnn_training.md](docs/public_cnn_training.md) for public-data-only CNN training notes.
 
 Run uncertainty and validation utilities:
 
@@ -90,7 +91,7 @@ Run Parts 9-10 batch processing and final submission asset generation:
 
 ```bash
 python3 scripts/run_parts_9_10_synthetic_batch.py --output-dir outputs_parts_9_10 --n-periods 500
-python3 scripts/run_parts_9_10_fits_directory.py /path/to/fits_dir --output-dir outputs_sector --max-targets 100 --cnn-model outputs_cnn
+python3 scripts/run_parts_9_10_fits_directory.py /path/to/fits_dir --output-dir outputs_sector --max-targets 100 --ai-model outputs_part6_ai/part6_ai_classifier.joblib --cnn-model outputs_cnn --timeout-seconds 300
 python3 scripts/generate_final_submission_assets.py outputs_sector/batch_final_candidate_catalog.csv --output-dir submission_assets
 ```
 
