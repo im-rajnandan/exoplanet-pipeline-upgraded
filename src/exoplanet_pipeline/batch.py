@@ -207,9 +207,11 @@ def run_raw_lightcurve_batch(
     # 2. Sequential execution
     if batch_config.n_workers <= 1:
         for i, (raw, key, per_target_path, summary_path) in enumerate(active_items):
+            print(f"[{i+1}/{len(active_items)}] Processing target {key}...", flush=True)
             key, status, df, row, err_str = _process_single_target_raw(
                 raw, key, model_bundle, cnn_bundle, pipeline_config, batch_config, per_target_path, summary_path
             )
+            print(f"  Finished target {key} with status: {status}", flush=True)
             if df is not None and not df.empty:
                 all_rows.append(df)
             target_rows.append(row)
@@ -342,9 +344,11 @@ def run_fits_file_batch(
     # 2. Sequential execution
     if batch_config.n_workers <= 1:
         for i, (path, key, per_target_path, summary_path) in enumerate(active_items):
+            print(f"[{i+1}/{len(active_items)}] Processing target {key} from {path.name}...", flush=True)
             key, status, df, row, err_str = _process_single_target_fits(
                 path, key, model_bundle, cnn_bundle, pipeline_config, batch_config, per_target_path, summary_path
             )
+            print(f"  Finished target {key} with status: {status}", flush=True)
             if df is not None and not df.empty:
                 all_rows.append(df)
             target_rows.append(row)
@@ -366,8 +370,10 @@ def run_fits_file_batch(
                 )
                 futures[fut] = (key, path, summary_path)
 
+            n_completed = 0
             for fut in concurrent.futures.as_completed(futures):
                 key, path, summary_path = futures[fut]
+                n_completed += 1
                 try:
                     _, status, df, row, err_str = fut.result(timeout=batch_config.timeout_seconds)
                 except concurrent.futures.TimeoutError:
@@ -385,6 +391,7 @@ def run_fits_file_batch(
                     with open(summary_path, "w", encoding="utf-8") as f:
                         json.dump(row, f, indent=2, default=_json_default)
 
+                print(f"[{n_completed}/{len(active_items)}] Finished target {key} from {path.name} with status: {status}", flush=True)
                 if df is not None and not df.empty:
                     all_rows.append(df)
                 target_rows.append(row)
