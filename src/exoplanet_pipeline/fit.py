@@ -353,9 +353,8 @@ def bootstrap_depth_uncertainty(event_depths: pd.DataFrame, random_seed: int = 4
         err = np.nan
     else:
         rng = np.random.default_rng(random_seed)
-        boot = np.empty(n_bootstrap)
-        for i in range(n_bootstrap):
-            boot[i] = np.nanmedian(rng.choice(vals, size=vals.size, replace=True))
+        choices = rng.choice(vals, size=(n_bootstrap, vals.size), replace=True)
+        boot = np.nanmedian(choices, axis=1)
         err = float(np.nanstd(boot, ddof=1))
     return {"depth_fraction_bootstrap_err": err, "depth_ppm_bootstrap_err": err * 1e6 if np.isfinite(err) else np.nan}
 

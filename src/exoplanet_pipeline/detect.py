@@ -422,6 +422,167 @@ def run_tls(clean: CleanLightCurve, config: PipelineConfig, flux: np.ndarray | N
     return candidate, diag
 
 
+def run_bls_pytorch(
+    clean: CleanLightCurve,
+    config: PipelineConfig,
+    flux: np.ndarray | None = None,
+    detrend_variant: str = "default",
+) -> tuple[CandidateSignal | None, dict]:
+    try:
+        import torch
+    except ImportError:
+        return None, {"status": "MISSING_TORCH"}
+
+    try:
+        time = np.asarray(clean.time, dtype=float)
+        y = np.asarray(clean.flux_detrended if flux is None else flux, dtype=float)
+        finite = np.isfinite(time) & np.isfinite(y)
+        time = time[finite]
+        y = y[finite]
+        if len(time) < config.min_clean_points:
+            return None, {"status": "TOO_FEW_POINTS"}
+
+        periods = build_period_grid(time, config)
+        durations = build_duration_grid(config)
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        t_tensor = torch.as_tensor(time, dtype=torch.float32, device=device)
+        y_tensor = torch.as_tensor(y - np.nanmedian(y), dtype=torch.float32, device=device)
+        periods_tensor = torch.as_tensor(periods, dtype=torch.float32, device=device)
+        durations_tensor = torch.as_tensor(durations, dtype=torch.float32, device=device)
+
+        N = t_tensor.size(0)
+        P = periods_tensor.size(0)
+        M = 240
+
+        t_min = t_tensor.min()
+        dt = t_tensor - t_min
+
+        phases = (dt.unsqueeze(0) / periods_tensor.unsqueeze(1)) % 1.0
+        bin_indices = torch.floor(phases * M).long().clamp(0, M - 1)
+
+        sums = torch.zeros(P, M, device=device)
+        counts = torch.zeros(P, M, device=device)
+
+        y_expanded = y_tensor.unsqueeze(0).expand(P, N)
+        ones = torch.ones(P, N, device=device)
+
+        sums.scatter_add_(1, bin_indices, y_expanded)
+        counts.scatter_add_(1, bin_indices, ones)
+
+        good = counts > 0
+        means = torch.where(good, sums / counts.clamp_min(1.0), torch.zeros_like(sums))
+
+        doubled = torch.cat([means, means], dim=1)
+
+        cumsum = torch.zeros(P, 2 * M + 1, device=device)
+        torch.cumsum(doubled, dim=1, out=cumsum[:, 1:])
+
+        glob_noise = robust_sigma(y)
+
+        best_score = -np.inf
+        best_period = np.nan
+        best_duration = np.nan
+        best_phase_center = np.nan
+        best_power = np.nan
+
+        k_tensor = torch.arange(M, device=device).unsqueeze(0)  # (1, M)
+        period_power = torch.full((P,), -np.inf, device=device)
+
+        for d in durations:
+            width_bins = (d / periods_tensor * M).round().long().clamp(1, M // 3)
+            end_indices = k_tensor + width_bins.unsqueeze(1)
+
+            sum_vals = torch.gather(cumsum, 1, end_indices) - torch.gather(cumsum, 1, k_tensor.expand(P, M))
+            roll = sum_vals / width_bins.unsqueeze(1)
+
+            min_roll, min_idx = torch.min(roll, dim=1)
+
+            depth_proxy = -min_roll
+            score = torch.where(
+                (glob_noise > 0) & (depth_proxy > 0),
+                depth_proxy / glob_noise * torch.sqrt(width_bins.float()),
+                torch.tensor(-np.inf, device=device)
+            )
+            period_power = torch.max(period_power, score)
+
+            val, idx = torch.max(score, dim=0)
+            if val.item() > best_score:
+                best_score = val.item()
+                best_p_idx = idx.item()
+                best_period = float(periods[best_p_idx])
+                best_duration = float(d)
+                best_phase_center = float((min_idx[best_p_idx].item() + 0.5 * width_bins[best_p_idx].item()) / M)
+                best_power = float(depth_proxy[best_p_idx].item())
+
+        if not np.isfinite(best_score):
+            return None, {"status": "NO_POWER"}
+
+        power_np = period_power.cpu().numpy()
+        power_sigma = robust_sigma(power_np)
+        sde = float((best_score - np.nanmedian(power_np)) / power_sigma) if power_sigma > 0 else 0.0
+
+        period = best_period
+        duration = best_duration
+        t0 = float(time.min() + best_phase_center * period)
+        while t0 - period > time.min():
+            t0 -= period
+        while t0 < time.min() - 0.5 * period:
+            t0 += period
+
+        depth_stats = estimate_depth_snr(time, y, period, t0, duration)
+        n_tr, n_full = count_transits(time, period, t0, duration)
+
+        status = _status_from_scores(float(depth_stats["snr"]), sde, n_tr, config)
+        warnings_list = []
+        if n_tr < config.min_transits:
+            warnings_list.append("TOO_FEW_TRANSITS")
+        if depth_stats["depth_fraction"] <= 0:
+            warnings_list.append("NON_POSITIVE_DEPTH")
+
+        candidate = CandidateSignal(
+            tic_id=clean.tic_id,
+            sector=clean.sector,
+            candidate_id=1,
+            period_days=period,
+            epoch_time=t0,
+            duration_days=duration,
+            depth_fraction=float(depth_stats["depth_fraction"]),
+            depth_ppm=float(depth_stats["depth_ppm"]),
+            snr=float(depth_stats["snr"]),
+            local_snr=float(depth_stats["local_snr"]),
+            sde=sde,
+            fap=None,
+            n_transits=n_tr,
+            n_full_transits=n_full,
+            n_in_transit_points=int(depth_stats["n_in_transit_points"]),
+            detection_method="BLS_PYTORCH",
+            flux_source=clean.selected_flux_source,
+            detrend_variant=detrend_variant,
+            periodogram_peak_power=best_power,
+            period_uncertainty_rough=None,
+            status=status,
+            warnings=warnings_list,
+            extra={
+                "period_grid_min": float(periods.min()),
+                "period_grid_max": float(periods.max()),
+                "n_periods": int(len(periods)),
+                "n_durations": int(len(durations)),
+                "device": device,
+            },
+        )
+        diag = {
+            "status": "OK",
+            "device": device,
+            "best_score": best_score,
+            "sde": sde,
+        }
+        return candidate, diag
+    except Exception as exc:
+        return None, {"status": "PYTORCH_BLS_FAILED", "error": repr(exc)}
+
+
 def detect_candidates(clean: CleanLightCurve, config: PipelineConfig | None = None, use_variants: bool = True) -> DetectionResult:
     config = config or PipelineConfig()
     if clean.status != "OK":
@@ -442,7 +603,9 @@ def detect_candidates(clean: CleanLightCurve, config: PipelineConfig | None = No
             methods = ["bls", "tls"]
         for method in methods:
             if method == "bls":
-                cand, diag = run_bls(clean, config, flux=flux, detrend_variant=variant_name)
+                cand, diag = run_bls_pytorch(clean, config, flux=flux, detrend_variant=variant_name)
+                if cand is None or diag.get("status") in ("MISSING_TORCH", "PYTORCH_BLS_FAILED"):
+                    cand, diag = run_bls(clean, config, flux=flux, detrend_variant=variant_name)
             elif method == "tls":
                 cand, diag = run_tls(clean, config, flux=flux, detrend_variant=variant_name)
             else:

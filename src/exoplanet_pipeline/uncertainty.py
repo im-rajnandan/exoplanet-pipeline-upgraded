@@ -149,12 +149,9 @@ def residual_bootstrap_depth_uncertainty(
     if out_resid.size < 10 or in_resid.size < 3:
         return {"depth_bootstrap_err_fraction": np.nan, "depth_bootstrap_err_ppm": np.nan}
     rng = np.random.default_rng(random_seed)
-    vals = np.empty(n_bootstrap, dtype=float)
-    for i in range(n_bootstrap):
-        # resample both baseline and in-transit residuals to preserve the median estimator's variance
-        out_sample = baseline + rng.choice(out_resid, size=out_resid.size, replace=True)
-        in_sample = in_flux + rng.choice(in_resid, size=in_resid.size, replace=True)
-        vals[i] = np.nanmedian(out_sample) - np.nanmedian(in_sample)
+    out_samples = baseline + rng.choice(out_resid, size=(n_bootstrap, out_resid.size), replace=True)
+    in_samples = in_flux + rng.choice(in_resid, size=(n_bootstrap, in_resid.size), replace=True)
+    vals = np.nanmedian(out_samples, axis=1) - np.nanmedian(in_samples, axis=1)
     err = float(np.nanstd(vals, ddof=1))
     # Degenerate synthetic cases may produce zero; keep a noise-floor based estimate then.
     if not np.isfinite(err) or err <= 0:
