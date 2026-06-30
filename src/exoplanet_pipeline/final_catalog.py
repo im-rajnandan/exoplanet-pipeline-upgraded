@@ -109,18 +109,18 @@ def harmonize_candidate_catalog(catalog: pd.DataFrame) -> pd.DataFrame:
         "confidence_level",
     ]).fillna("").astype(str)
     # Numeric science fields with fallbacks.
-    out["period_days"] = _as_float(_pick_first_existing(out, ["unc_period_days", "fit_period_days", "period_days"]))
+    out["period_days"] = _as_float(_pick_first_existing(out, ["unc_period_days", "fit_period_days", "period_days"])).clip(1e-6, None)
     out["period_err_days"] = _as_float(_pick_first_existing(out, ["unc_period_err_days", "fit_period_err_days", "period_uncertainty_rough"]))
     out["epoch_time"] = _as_float(_pick_first_existing(out, ["unc_epoch_time", "fit_epoch_time", "epoch_time"]))
     out["epoch_err_days"] = _as_float(_pick_first_existing(out, ["unc_epoch_err_days", "fit_epoch_err_days"]))
-    out["duration_days"] = _as_float(_pick_first_existing(out, ["unc_duration_days", "fit_duration_days", "duration_days"]))
+    out["duration_days"] = _as_float(_pick_first_existing(out, ["unc_duration_days", "fit_duration_days", "duration_days"])).clip(1e-6, None)
     out["duration_hours"] = out["duration_days"] * 24.0
     out["duration_err_days"] = _as_float(_pick_first_existing(out, ["unc_duration_err_days", "fit_duration_err_days"]))
     out["duration_err_hours"] = out["duration_err_days"] * 24.0
-    out["depth_ppm"] = _as_float(_pick_first_existing(out, ["unc_depth_ppm", "fit_depth_ppm", "depth_ppm"]))
+    out["depth_ppm"] = _as_float(_pick_first_existing(out, ["unc_depth_ppm", "fit_depth_ppm", "depth_ppm"])).clip(1e-6, None)
     out["depth_err_ppm"] = _as_float(_pick_first_existing(out, ["unc_depth_err_ppm", "fit_depth_err_ppm"]))
-    out["snr"] = _as_float(_pick_first_existing(out, ["unc_snr", "fit_snr", "local_snr", "snr"]))
-    out["effective_snr"] = _as_float(_pick_first_existing(out, ["unc_effective_snr", "fit_snr", "local_snr", "snr"]))
+    out["snr"] = _as_float(_pick_first_existing(out, ["unc_snr", "fit_snr", "local_snr", "snr"])).clip(0.0, None)
+    out["effective_snr"] = _as_float(_pick_first_existing(out, ["unc_effective_snr", "fit_snr", "local_snr", "snr"])).clip(0.0, None)
     out["selected_flux_source"] = _pick_first_existing(out, ["flux_source", "selected_flux_source"]).fillna("").astype(str)
 
     out["crowdsap"] = _as_float(_pick_first_existing(out, ["vet_crowdsap", "crowdsap"]))
