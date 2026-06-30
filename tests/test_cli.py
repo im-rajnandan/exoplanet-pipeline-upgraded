@@ -28,6 +28,9 @@ def test_main_scripts_show_help():
     scripts = [
         "scripts/run_parts_1_to_5_fits.py",
         "scripts/run_parts_9_10_fits_directory.py",
+        "scripts/run_tic_ctl_pipeline.py",
+        "scripts/build_labeled_candidate_catalog.py",
+        "scripts/build_public_cnn_examples.py",
         "scripts/train_ai_classifier_from_catalog.py",
         "scripts/validate_candidate_catalog.py",
     ]

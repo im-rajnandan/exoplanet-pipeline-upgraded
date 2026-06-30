@@ -16,6 +16,7 @@ from exoplanet_pipeline.cnn import load_cnn_bundle
 from exoplanet_pipeline.config import PipelineConfig
 from exoplanet_pipeline.final_outputs import generate_submission_package_outputs
 from exoplanet_pipeline.ingest import search_and_download_tess_lc
+from exoplanet_pipeline.ml import load_model_bundle
 from exoplanet_pipeline.public_data import read_tic_ctl_catalog, write_tic_ctl_target_list
 
 
@@ -29,11 +30,20 @@ def main() -> None:
     parser.add_argument("--sector", type=int, default=None)
     parser.add_argument("--download-dir", default="data/public/lightcurves")
     parser.add_argument("--output-dir", default="outputs_tic_ctl_pipeline")
+    parser.add_argument("--ai-model", default=None, help="Optional sklearn AI model bundle .joblib")
     parser.add_argument("--cnn-model", default=None, help="Optional CNN bundle directory or cnn_model.pt path")
     parser.add_argument("--n-periods", type=int, default=2000)
+    parser.add_argument("--period-min-days", type=float, default=0.20)
+    parser.add_argument("--period-max-days", type=float, default=None)
     parser.add_argument("--method", choices=["bls", "tls", "both"], default="bls")
+    parser.add_argument("--detrend-method", choices=["rolling_median", "wotan_biweight", "none"], default="rolling_median")
+    parser.add_argument("--quality-mask-mode", choices=["none", "minimal", "conservative", "strict"], default="conservative")
+    parser.add_argument("--min-clean-points", type=int, default=500)
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--n-workers", type=int, default=4, help="Number of parallel download/processing workers")
+    parser.add_argument("--timeout-seconds", type=float, default=300.0, help="Per-FITS processing timeout; use 0 to disable")
+    parser.add_argument("--validation-report", type=str, default=None, help="Optional validation_report.json to include in generated report assets")
+    parser.add_argument("--use-variants", action="store_true", help="Search multiple detrending variants; slower but more complete")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -94,17 +104,33 @@ def main() -> None:
         print(f"No TESS light-curve FITS files found/downloaded. See {output_dir / 'tic_ctl_download_manifest.csv'}")
         return
 
-    pipeline_config = PipelineConfig(n_periods=args.n_periods, detection_method=args.method, make_plots=False, detection_use_variants=False)
+    pipeline_config = PipelineConfig(
+        n_periods=args.n_periods,
+        period_min_days=args.period_min_days,
+        period_max_days=args.period_max_days,
+        detection_method=args.method,
+        detrend_method=args.detrend_method,
+        quality_mask_mode=args.quality_mask_mode,
+        min_clean_points=args.min_clean_points,
+        make_plots=False,
+        detection_use_variants=args.use_variants,
+    )
     batch_config = BatchRunConfig(
         output_dir=output_dir,
         cache_dir=output_dir / "cache",
         resume=not args.no_resume,
         max_targets=None,
         n_workers=args.n_workers,
+        timeout_seconds=None if args.timeout_seconds == 0 else args.timeout_seconds,
     )
+    model_bundle = load_model_bundle(args.ai_model) if args.ai_model else None
     cnn_bundle = load_cnn_bundle(args.cnn_model) if args.cnn_model else None
-    result = run_fits_file_batch(fits_paths, cnn_bundle=cnn_bundle, pipeline_config=pipeline_config, batch_config=batch_config)
-    paths = generate_submission_package_outputs(result["final_candidate_catalog"], output_dir / "submission_assets")
+    result = run_fits_file_batch(fits_paths, model_bundle=model_bundle, cnn_bundle=cnn_bundle, pipeline_config=pipeline_config, batch_config=batch_config)
+    paths = generate_submission_package_outputs(
+        result["final_candidate_catalog"],
+        output_dir / "submission_assets",
+        validation_report_path=args.validation_report,
+    )
     print("TIC/CTL pipeline complete.")
     print(f"Targets: {len(targets)}")
     print(f"FITS files: {len(fits_paths)}")

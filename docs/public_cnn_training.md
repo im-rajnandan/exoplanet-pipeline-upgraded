@@ -3,6 +3,10 @@
 This project should run from original public TIC/CTL target catalogs and public
 MAST light curves. Synthetic examples remain useful only for fast smoke tests.
 
+For the end-to-end Kaggle workflow with curated labels, trained model bundles,
+science FITS runs, validation, and final assets, see
+[kaggle_real_run.md](kaggle_real_run.md).
+
 ## Official Sources
 
 - NASA Exoplanet Archive TAP service: official programmatic access for TOI and
