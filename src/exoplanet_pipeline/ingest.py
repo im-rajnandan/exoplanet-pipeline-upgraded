@@ -134,7 +134,7 @@ def search_and_download_tess_lc(tic_id: int, sector: int | None = None, download
         raise RuntimeError("Install astroquery to download from MAST.") from exc
 
     criteria = {
-        "target_name": f"TIC {tic_id}",
+        "target_name": str(tic_id),
         "dataproduct_type": "timeseries",
         "obs_collection": "TESS",
     }
