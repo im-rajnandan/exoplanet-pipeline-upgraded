@@ -17,6 +17,19 @@ from .cnn_views import (
 )
 from .ml import CANONICAL_CLASSES, _apply_physical_guardrails, _renormalize_probs
 
+try:
+    import torch
+    from torch import nn
+    import torch.nn.functional as F
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    class nn:
+        class Module:
+            pass
+    F = None
+
+
 
 PLANET_CLASS = "PLANETARY_TRANSIT_CANDIDATE"
 FALSE_POSITIVE_BINARY_LABEL = "false_positive_or_other"
@@ -80,93 +93,93 @@ class CNNTrainingResult:
 
 
 def _require_torch():
-    try:
-        import torch
-        from torch import nn
-        import torch.nn.functional as F
-    except Exception as exc:  # pragma: no cover - exercised when optional extra is absent
-        raise ImportError('CNN vetting requires PyTorch. Install with: pip install -e ".[deep]"') from exc
+    if not HAS_TORCH:
+        raise ImportError('CNN vetting requires PyTorch. Install with: pip install -e ".[deep]"')
+    import torch
+    from torch import nn
+    import torch.nn.functional as F
     return torch, nn, F
+
+
+class _ConvBranch(nn.Module):
+    def __init__(self, in_channels: int, channels: int, embedding_dim: int, dropout: float):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(in_channels, channels, kernel_size=7, padding=3),
+            nn.ReLU(),
+            nn.BatchNorm1d(channels),
+            nn.MaxPool1d(kernel_size=4),
+            nn.Conv1d(channels, channels * 2, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.BatchNorm1d(channels * 2),
+            nn.MaxPool1d(kernel_size=4),
+            nn.Conv1d(channels * 2, channels * 2, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Dropout(dropout),
+            nn.Linear(channels * 2, embedding_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class _CandidateVetterCNN(nn.Module):
+    def __init__(self, model_config: CNNModelConfig):
+        super().__init__()
+        self.config = model_config
+        self.global_branch = _ConvBranch(
+            model_config.input_channels,
+            model_config.conv_channels,
+            model_config.view_embedding_dim,
+            model_config.dropout,
+        )
+        self.local_branch = _ConvBranch(
+            model_config.input_channels,
+            model_config.conv_channels,
+            model_config.view_embedding_dim,
+            model_config.dropout,
+        )
+        self.scalar_branch = nn.Sequential(
+            nn.Linear(len(model_config.scalar_feature_names), model_config.scalar_embedding_dim),
+            nn.ReLU(),
+            nn.Dropout(model_config.dropout),
+            nn.Linear(model_config.scalar_embedding_dim, model_config.scalar_embedding_dim),
+            nn.ReLU(),
+        )
+        fusion_in = model_config.view_embedding_dim * 2 + model_config.scalar_embedding_dim
+        self.fusion = nn.Sequential(
+            nn.Linear(fusion_in, model_config.fusion_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(model_config.dropout),
+            nn.Linear(model_config.fusion_hidden_dim, model_config.fusion_hidden_dim // 2),
+            nn.ReLU(),
+        )
+        self.class_head = nn.Linear(model_config.fusion_hidden_dim // 2, len(model_config.canonical_classes))
+        self.binary_head = nn.Linear(model_config.fusion_hidden_dim // 2, 1)
+
+    def forward(self, global_flux, local_views, scalars):
+        global_emb = self.global_branch(global_flux)
+        batch, n_views, channels, n_bins = local_views.shape
+        flat_local = local_views.reshape(batch * n_views, channels, n_bins)
+        local_emb = self.local_branch(flat_local).reshape(batch, n_views, -1)
+        view_valid = (local_views[:, :, 1, :].sum(dim=-1) > 0).float().unsqueeze(-1)
+        denom = view_valid.sum(dim=1).clamp_min(1.0)
+        local_emb = (local_emb * view_valid).sum(dim=1) / denom
+        scalar_emb = self.scalar_branch(scalars)
+        fused = self.fusion(torch.cat([global_emb, local_emb, scalar_emb], dim=1))
+        return {
+            "class_logits": self.class_head(fused),
+            "binary_logit": self.binary_head(fused).squeeze(-1),
+        }
 
 
 def create_cnn_model(config: CNNModelConfig | dict[str, Any] | None = None):
     """Instantiate the optional PyTorch CNN model on demand."""
-    torch, nn, _ = _require_torch()
+    _require_torch()
     cfg = CNNModelConfig.from_dict(config) if isinstance(config, dict) or config is None else config
-
-    class _ConvBranch(nn.Module):
-        def __init__(self, in_channels: int, channels: int, embedding_dim: int, dropout: float):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Conv1d(in_channels, channels, kernel_size=7, padding=3),
-                nn.ReLU(),
-                nn.BatchNorm1d(channels),
-                nn.MaxPool1d(kernel_size=4),
-                nn.Conv1d(channels, channels * 2, kernel_size=5, padding=2),
-                nn.ReLU(),
-                nn.BatchNorm1d(channels * 2),
-                nn.MaxPool1d(kernel_size=4),
-                nn.Conv1d(channels * 2, channels * 2, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.AdaptiveAvgPool1d(1),
-                nn.Flatten(),
-                nn.Dropout(dropout),
-                nn.Linear(channels * 2, embedding_dim),
-                nn.ReLU(),
-            )
-
-        def forward(self, x):
-            return self.net(x)
-
-    class _CandidateVetterCNN(nn.Module):
-        def __init__(self, model_config: CNNModelConfig):
-            super().__init__()
-            self.config = model_config
-            self.global_branch = _ConvBranch(
-                model_config.input_channels,
-                model_config.conv_channels,
-                model_config.view_embedding_dim,
-                model_config.dropout,
-            )
-            self.local_branch = _ConvBranch(
-                model_config.input_channels,
-                model_config.conv_channels,
-                model_config.view_embedding_dim,
-                model_config.dropout,
-            )
-            self.scalar_branch = nn.Sequential(
-                nn.Linear(len(model_config.scalar_feature_names), model_config.scalar_embedding_dim),
-                nn.ReLU(),
-                nn.Dropout(model_config.dropout),
-                nn.Linear(model_config.scalar_embedding_dim, model_config.scalar_embedding_dim),
-                nn.ReLU(),
-            )
-            fusion_in = model_config.view_embedding_dim * 2 + model_config.scalar_embedding_dim
-            self.fusion = nn.Sequential(
-                nn.Linear(fusion_in, model_config.fusion_hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(model_config.dropout),
-                nn.Linear(model_config.fusion_hidden_dim, model_config.fusion_hidden_dim // 2),
-                nn.ReLU(),
-            )
-            self.class_head = nn.Linear(model_config.fusion_hidden_dim // 2, len(model_config.canonical_classes))
-            self.binary_head = nn.Linear(model_config.fusion_hidden_dim // 2, 1)
-
-        def forward(self, global_flux, local_views, scalars):
-            global_emb = self.global_branch(global_flux)
-            batch, n_views, channels, n_bins = local_views.shape
-            flat_local = local_views.reshape(batch * n_views, channels, n_bins)
-            local_emb = self.local_branch(flat_local).reshape(batch, n_views, -1)
-            view_valid = (local_views[:, :, 1, :].sum(dim=-1) > 0).float().unsqueeze(-1)
-            denom = view_valid.sum(dim=1).clamp_min(1.0)
-            local_emb = (local_emb * view_valid).sum(dim=1) / denom
-            scalar_emb = self.scalar_branch(scalars)
-            fused = self.fusion(torch.cat([global_emb, local_emb, scalar_emb], dim=1))
-            return {
-                "class_logits": self.class_head(fused),
-                "binary_logit": self.binary_head(fused).squeeze(-1),
-            }
-
     return _CandidateVetterCNN(cfg)
 
 
