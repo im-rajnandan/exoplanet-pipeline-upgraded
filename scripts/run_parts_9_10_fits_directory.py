@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--n-periods", type=int, default=2000)
     parser.add_argument("--method", choices=["bls", "tls", "both"], default="bls")
     parser.add_argument("--cnn-model", type=str, default=None, help="Optional CNN bundle directory or cnn_model.pt path")
+    parser.add_argument("--n-workers", type=int, default=4, help="Number of parallel execution workers")
     args = parser.parse_args()
 
     fits_files = discover_fits_files(args.fits_dir, recursive=True)
@@ -34,7 +35,13 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     pipeline_config = PipelineConfig(n_periods=args.n_periods, detection_method=args.method, make_plots=False)
-    batch_config = BatchRunConfig(output_dir=output_dir, cache_dir=output_dir / "cache", resume=not args.no_resume, max_targets=args.max_targets)
+    batch_config = BatchRunConfig(
+        output_dir=output_dir,
+        cache_dir=output_dir / "cache",
+        resume=not args.no_resume,
+        max_targets=args.max_targets,
+        n_workers=args.n_workers,
+    )
     cnn_bundle = load_cnn_bundle(args.cnn_model) if args.cnn_model else None
     result = run_fits_file_batch(fits_files, cnn_bundle=cnn_bundle, pipeline_config=pipeline_config, batch_config=batch_config)
     paths = generate_submission_package_outputs(result["final_candidate_catalog"], output_dir / "submission_assets")
