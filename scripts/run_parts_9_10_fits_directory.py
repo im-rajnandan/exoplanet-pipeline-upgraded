@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import argparse
 import sys
+import os
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -23,7 +24,8 @@ def main() -> None:
     parser.add_argument("--n-periods", type=int, default=2000)
     parser.add_argument("--method", choices=["bls", "tls", "both"], default="bls")
     parser.add_argument("--cnn-model", type=str, default=None, help="Optional CNN bundle directory or cnn_model.pt path")
-    parser.add_argument("--n-workers", type=int, default=4, help="Number of parallel execution workers")
+    parser.add_argument("--n-workers", type=int, default=os.cpu_count() or 2, help="Number of parallel execution workers")
+    parser.add_argument("--no-variants", action="store_true", help="Disable searching across multiple detrending variants (speed up search by 4x)")
     args = parser.parse_args()
 
     fits_files = discover_fits_files(args.fits_dir, recursive=True)
@@ -34,7 +36,12 @@ def main() -> None:
         parser.error(f"No FITS files found under {args.fits_dir!r}")
 
     output_dir = Path(args.output_dir)
-    pipeline_config = PipelineConfig(n_periods=args.n_periods, detection_method=args.method, make_plots=False)
+    pipeline_config = PipelineConfig(
+        n_periods=args.n_periods,
+        detection_method=args.method,
+        make_plots=False,
+        detection_use_variants=not args.no_variants
+    )
     batch_config = BatchRunConfig(
         output_dir=output_dir,
         cache_dir=output_dir / "cache",
