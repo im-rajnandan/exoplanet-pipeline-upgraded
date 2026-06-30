@@ -466,7 +466,7 @@ def run_bls_pytorch(
         counts = torch.zeros(P, M, device=device)
 
         y_expanded = y_tensor.unsqueeze(0).expand(P, N)
-        ones = torch.ones(P, N, device=device)
+        ones = torch.ones_like(y_tensor).unsqueeze(0).expand(P, N)
 
         sums.scatter_add_(1, bin_indices, y_expanded)
         counts.scatter_add_(1, bin_indices, ones)
