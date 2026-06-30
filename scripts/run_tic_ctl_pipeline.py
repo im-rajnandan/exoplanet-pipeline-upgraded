@@ -33,6 +33,7 @@ def main() -> None:
     parser.add_argument("--n-periods", type=int, default=2000)
     parser.add_argument("--method", choices=["bls", "tls", "both"], default="bls")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--n-workers", type=int, default=4, help="Number of parallel download/processing workers")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -48,14 +49,32 @@ def main() -> None:
     download_dir.mkdir(parents=True, exist_ok=True)
     fits_paths: list[Path] = []
     download_rows: list[dict] = []
-    for _, row in targets.iterrows():
+
+    import concurrent.futures
+    print(f"Downloading TESS light curves for {len(targets)} targets with {args.n_workers} threads...", flush=True)
+
+    def _download_single_target(row_tuple):
+        _, row = row_tuple
         tic_id = int(row["tic_id"])
         try:
             paths = search_and_download_tess_lc(tic_id, sector=args.sector, download_dir=download_dir)
-            fits_paths.extend(paths)
-            download_rows.append({"tic_id": tic_id, "n_files": len(paths), "status": "ok" if paths else "no_lightcurve"})
+            return {"tic_id": tic_id, "paths": paths, "status": "ok" if paths else "no_lightcurve", "error": None}
         except Exception as exc:
-            download_rows.append({"tic_id": tic_id, "n_files": 0, "status": "download_failed", "error": repr(exc)})
+            return {"tic_id": tic_id, "paths": [], "status": "download_failed", "error": repr(exc)}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.n_workers) as executor:
+        futures = {executor.submit(_download_single_target, item): item for item in targets.iterrows()}
+        for i, fut in enumerate(concurrent.futures.as_completed(futures)):
+            res = fut.result()
+            tic_id = res["tic_id"]
+            paths = res["paths"]
+            fits_paths.extend(paths)
+            if res["error"] is not None:
+                download_rows.append({"tic_id": tic_id, "n_files": 0, "status": res["status"], "error": res["error"]})
+            else:
+                download_rows.append({"tic_id": tic_id, "n_files": len(paths), "status": res["status"]})
+            if (i + 1) % 10 == 0 or (i + 1) == len(targets):
+                print(f"  [{i+1}/{len(targets)}] targets downloaded", flush=True)
 
     download_manifest = pd.DataFrame(download_rows)
     download_manifest.to_csv(output_dir / "tic_ctl_download_manifest.csv", index=False)
@@ -76,7 +95,13 @@ def main() -> None:
         return
 
     pipeline_config = PipelineConfig(n_periods=args.n_periods, detection_method=args.method, make_plots=False, detection_use_variants=False)
-    batch_config = BatchRunConfig(output_dir=output_dir, cache_dir=output_dir / "cache", resume=not args.no_resume, max_targets=None)
+    batch_config = BatchRunConfig(
+        output_dir=output_dir,
+        cache_dir=output_dir / "cache",
+        resume=not args.no_resume,
+        max_targets=None,
+        n_workers=args.n_workers,
+    )
     cnn_bundle = load_cnn_bundle(args.cnn_model) if args.cnn_model else None
     result = run_fits_file_batch(fits_paths, cnn_bundle=cnn_bundle, pipeline_config=pipeline_config, batch_config=batch_config)
     paths = generate_submission_package_outputs(result["final_candidate_catalog"], output_dir / "submission_assets")
