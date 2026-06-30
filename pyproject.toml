@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exoplanet-parts1-10"
+version = "1.0.0"
+description = "End-to-end TESS exoplanet detection, vetting, AI classification, validation, and batch-catalog pipeline"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "astropy>=6.0",
+    "scikit-learn>=1.3",
+    "joblib>=1.3",
+]
+
+[project.optional-dependencies]
+mast = [
+    "astroquery>=0.4.7",
+]
+dev = [
+    "pytest>=8.0",
+]
+deep = [
+    "torch>=2.2",
+]
+notebook = [
+    "jupyter>=1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --tb=short"
