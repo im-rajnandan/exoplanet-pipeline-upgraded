@@ -39,6 +39,8 @@ class BatchRunConfig:
     write_heartbeat_every: int = 10
     n_workers: int = 1
     timeout_seconds: float | None = 60.0
+    progress_style: str = "lines"
+    progress_every: int = 1
 
     def resolved_run_id(self) -> str:
         if self.run_id:
@@ -129,6 +131,61 @@ def _safe_max(df: Any, cols: list[str]) -> float | None:
             if vals.notna().any():
                 return float(vals.max())
     return None
+
+
+def _format_eta(seconds: float | None) -> str:
+    if seconds is None or not np.isfinite(seconds) or seconds < 0:
+        return "unknown"
+    seconds = int(seconds)
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _batch_progress_text(completed: int, total: int, started: float, status: str, *, width: int = 28) -> str:
+    pct = completed / max(total, 1)
+    filled = min(width, int(width * pct))
+    bar = "#" * filled + "." * (width - filled)
+    elapsed = max(time.monotonic() - started, 1e-6)
+    rate = completed / elapsed
+    eta = (total - completed) / rate if rate > 0 else None
+    return (
+        f"[{bar}] {completed}/{total} {pct * 100.0:5.1f}% "
+        f"rate={rate * 60.0:.2f} targets/min "
+        f"eta={_format_eta(eta)} "
+        f"last={status}"
+    )
+
+
+def _emit_batch_progress(
+    completed: int,
+    total: int,
+    started: float,
+    status: str,
+    batch_config: BatchRunConfig,
+    state: dict[str, Any],
+    *,
+    message: str,
+) -> None:
+    style = (batch_config.progress_style or "lines").lower()
+    if style == "none":
+        return
+    if style == "bar":
+        text = _batch_progress_text(completed, total, started, status)
+        last_len = int(state.get("last_len", 0))
+        padding = " " * max(0, last_len - len(text))
+        print("\r" + text + padding, end="", flush=True)
+        state["last_len"] = len(text)
+        if completed == total:
+            print(flush=True)
+        return
+    progress_every = max(1, int(batch_config.progress_every))
+    if completed == 1 or completed == total or completed % progress_every == 0:
+        print(message, flush=True)
 
 
 def _process_single_target_raw(
@@ -314,12 +371,23 @@ def run_raw_lightcurve_batch(
 
     # 2. Sequential execution
     if batch_config.n_workers <= 1:
+        started = time.monotonic()
+        progress_state: dict[str, Any] = {}
         for i, (raw, key, per_target_path, summary_path) in enumerate(active_items):
-            print(f"[{i+1}/{len(active_items)}] Processing target {key}...", flush=True)
+            if (batch_config.progress_style or "lines").lower() == "lines":
+                print(f"[{i+1}/{len(active_items)}] Processing target {key}...", flush=True)
             key, status, df, row, err_str = _process_single_target_raw(
                 raw, key, model_bundle, cnn_bundle, pipeline_config, batch_config, per_target_path, summary_path
             )
-            print(f"  Finished target {key} with status: {status}", flush=True)
+            _emit_batch_progress(
+                i + 1,
+                len(active_items),
+                started,
+                status,
+                batch_config,
+                progress_state,
+                message=f"  Finished target {key} with status: {status}",
+            )
             if df is not None and not df.empty:
                 all_rows.append(df)
             target_rows.append(row)
@@ -331,6 +399,8 @@ def run_raw_lightcurve_batch(
                 _write_running_outputs(output_dir, all_rows, target_rows, failure_rows)
     # 3. Parallel execution with timeouts
     else:
+        started = time.monotonic()
+        progress_state: dict[str, Any] = {}
         tasks = [
             {
                 "key": key,
@@ -351,7 +421,15 @@ def run_raw_lightcurve_batch(
             1,
         ):
             key, status, df, row, err_str = result
-            print(f"[{n_completed}/{len(active_items)}] Finished target {key} with status: {status}", flush=True)
+            _emit_batch_progress(
+                n_completed,
+                len(active_items),
+                started,
+                status,
+                batch_config,
+                progress_state,
+                message=f"[{n_completed}/{len(active_items)}] Finished target {key} with status: {status}",
+            )
             if df is not None and not df.empty:
                 all_rows.append(df)
             target_rows.append(row)
@@ -442,12 +520,23 @@ def run_fits_file_batch(
 
     # 2. Sequential execution
     if batch_config.n_workers <= 1:
+        started = time.monotonic()
+        progress_state: dict[str, Any] = {}
         for i, (path, key, per_target_path, summary_path) in enumerate(active_items):
-            print(f"[{i+1}/{len(active_items)}] Processing target {key} from {path.name}...", flush=True)
+            if (batch_config.progress_style or "lines").lower() == "lines":
+                print(f"[{i+1}/{len(active_items)}] Processing target {key} from {path.name}...", flush=True)
             key, status, df, row, err_str = _process_single_target_fits(
                 path, key, model_bundle, cnn_bundle, pipeline_config, batch_config, per_target_path, summary_path
             )
-            print(f"  Finished target {key} with status: {status}", flush=True)
+            _emit_batch_progress(
+                i + 1,
+                len(active_items),
+                started,
+                status,
+                batch_config,
+                progress_state,
+                message=f"  Finished target {key} with status: {status}",
+            )
             if df is not None and not df.empty:
                 all_rows.append(df)
             target_rows.append(row)
@@ -459,6 +548,8 @@ def run_fits_file_batch(
                 _write_running_outputs(output_dir, all_rows, target_rows, failure_rows)
     # 3. Parallel execution with timeouts
     else:
+        started = time.monotonic()
+        progress_state: dict[str, Any] = {}
         tasks = [
             {
                 "key": key,
@@ -481,7 +572,15 @@ def run_fits_file_batch(
         ):
             key, status, df, row, err_str = result
             path = Path(task["source_file"])
-            print(f"[{n_completed}/{len(active_items)}] Finished target {key} from {path.name} with status: {status}", flush=True)
+            _emit_batch_progress(
+                n_completed,
+                len(active_items),
+                started,
+                status,
+                batch_config,
+                progress_state,
+                message=f"[{n_completed}/{len(active_items)}] Finished target {key} from {path.name} with status: {status}",
+            )
             if df is not None and not df.empty:
                 all_rows.append(df)
             target_rows.append(row)

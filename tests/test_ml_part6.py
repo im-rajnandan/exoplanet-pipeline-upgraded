@@ -1,6 +1,8 @@
 import tempfile
 from pathlib import Path
 
+import pandas as pd
+
 from exoplanet_pipeline.ml import (
     normalize_label,
     train_ai_classifier,
@@ -41,3 +43,27 @@ def test_synthetic_ml_catalog_training_prediction_roundtrip():
         loaded = load_model_bundle(path)
         pred2 = predict_ai_classifier(loaded, pred_input)
         assert len(pred2) == len(pred_input)
+
+
+def test_training_drops_all_nan_feature_columns():
+    df = pd.DataFrame(
+        {
+            "period_days": [1.0, 1.2, 2.0, 2.2, 3.0, 3.2],
+            "depth_ppm": [800, 850, 1500, 1450, 4000, 4200],
+            "fit_snr": [8, 9, 14, 15, 30, 32],
+            "snr": [None, None, None, None, None, None],
+            "label": ["planet", "planet", "planet", "false_positive", "false_positive", "false_positive"],
+        }
+    )
+
+    result = train_ai_classifier(
+        df,
+        label_col="label",
+        feature_columns=["period_days", "depth_ppm", "fit_snr", "snr"],
+        calibrate=False,
+        test_size=0.34,
+        random_state=7,
+    )
+
+    assert "snr" not in result.feature_columns
+    assert any("Dropped all-NaN feature columns" in warning for warning in result.warnings)
