@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import warnings
 import numpy as np
 
 from .schema import RawLightCurve
@@ -137,6 +138,7 @@ def search_and_download_tess_lc(
     """
     try:
         from astroquery.mast import Observations
+        from astroquery.exceptions import NoResultsWarning
     except ImportError as exc:
         raise RuntimeError("Install astroquery to download from MAST.") from exc
 
@@ -148,7 +150,10 @@ def search_and_download_tess_lc(
     if sector is not None:
         criteria["sequence_number"] = int(sector)
 
-    obs = Observations.query_criteria(**criteria)
+    with warnings.catch_warnings():
+        if not verbose:
+            warnings.simplefilter("ignore", NoResultsWarning)
+        obs = Observations.query_criteria(**criteria)
     if len(obs) == 0:
         return []
     products = Observations.get_product_list(obs)
