@@ -1,9 +1,12 @@
 from pathlib import Path
+import sys
+import types
+import warnings
 
 import numpy as np
 
 from exoplanet_pipeline.config import PipelineConfig
-from exoplanet_pipeline.ingest import load_tess_fits
+from exoplanet_pipeline.ingest import load_tess_fits, search_and_download_tess_lc
 from exoplanet_pipeline.pipeline import run_parts_1_to_5_from_fits
 from exoplanet_pipeline.preprocess import preprocess_raw_lightcurve
 
@@ -96,3 +99,32 @@ def test_parts_1_to_5_runs_from_generated_fits(tmp_path: Path):
     assert not result["catalog"].empty
     recovered = result["detection"].best_candidate.period_days
     assert abs(recovered - 3.0) / 3.0 < 0.05
+
+
+def test_mast_no_results_warning_is_suppressed(monkeypatch, tmp_path: Path):
+    class FakeNoResultsWarning(Warning):
+        pass
+
+    class FakeObservations:
+        @staticmethod
+        def query_criteria(**criteria):
+            warnings.warn("Query returned no results.", FakeNoResultsWarning)
+            return []
+
+    astroquery_mod = types.ModuleType("astroquery")
+    mast_mod = types.ModuleType("astroquery.mast")
+    exceptions_mod = types.ModuleType("astroquery.exceptions")
+    mast_mod.Observations = FakeObservations
+    exceptions_mod.NoResultsWarning = FakeNoResultsWarning
+    astroquery_mod.mast = mast_mod
+    astroquery_mod.exceptions = exceptions_mod
+    monkeypatch.setitem(sys.modules, "astroquery", astroquery_mod)
+    monkeypatch.setitem(sys.modules, "astroquery.mast", mast_mod)
+    monkeypatch.setitem(sys.modules, "astroquery.exceptions", exceptions_mod)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        paths = search_and_download_tess_lc(123456789, download_dir=tmp_path)
+
+    assert paths == []
+    assert not any(isinstance(item.message, FakeNoResultsWarning) for item in caught)
