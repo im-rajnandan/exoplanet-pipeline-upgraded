@@ -122,7 +122,14 @@ def load_tess_fits(file_path: str | Path) -> RawLightCurve:
         return RawLightCurve(None, None, np.array([]), status="FITS_READ_FAILED", error=repr(exc))
 
 
-def search_and_download_tess_lc(tic_id: int, sector: int | None = None, download_dir: str | Path = "data/raw") -> list[Path]:
+def search_and_download_tess_lc(
+    tic_id: int,
+    sector: int | None = None,
+    download_dir: str | Path = "data/raw",
+    *,
+    max_products: int | None = None,
+    verbose: bool = False,
+) -> list[Path]:
     """Optional helper for downloading TESS light curves with astroquery.
 
     This is intentionally separate from preprocessing so failures remain explicit.
@@ -149,5 +156,13 @@ def search_and_download_tess_lc(tic_id: int, sector: int | None = None, download
     lc_products = products[mask]
     if len(lc_products) == 0:
         return []
-    manifest = Observations.download_products(lc_products, download_dir=str(download_dir), mrp_only=False)
+    lc_products.sort("productFilename")
+    if max_products is not None:
+        lc_products = lc_products[: max(1, int(max_products))]
+    manifest = Observations.download_products(
+        lc_products,
+        download_dir=str(download_dir),
+        mrp_only=False,
+        verbose=verbose,
+    )
     return [Path(p) for p in manifest["Local Path"] if p]

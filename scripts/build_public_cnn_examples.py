@@ -127,7 +127,13 @@ def _process_single_row(
     results = []
     if not paths and args.download_missing:
         try:
-            paths = search_and_download_tess_lc(tic_id, sector=_sector_from_row(row), download_dir=lightcurve_dir)
+            paths = search_and_download_tess_lc(
+                tic_id,
+                sector=_sector_from_row(row),
+                download_dir=lightcurve_dir,
+                max_products=args.max_lightcurves_per_target,
+                verbose=args.mast_verbose,
+            )
         except Exception as exc:
             return [{"tic_id": tic_id, "status": "download_failed", "error": repr(exc)}]
     if not paths:
@@ -183,6 +189,7 @@ def main() -> None:
     parser.add_argument("--n-bootstrap", type=int, default=50)
     parser.add_argument("--detrend-method", default="rolling_median", choices=["rolling_median", "wotan_biweight", "none"])
     parser.add_argument("--n-workers", type=int, default=16, help="Number of concurrent download/processing threads")
+    parser.add_argument("--mast-verbose", action="store_true", help="Show per-file astroquery/MAST download logs")
     args = parser.parse_args()
 
     metadata = read_public_metadata(args.metadata_csv, args.source) if args.source else pd.read_csv(args.metadata_csv)
