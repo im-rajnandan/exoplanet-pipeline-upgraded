@@ -44,6 +44,7 @@ def main() -> None:
     parser.add_argument("--timeout-seconds", type=float, default=300.0, help="Per-FITS processing timeout; use 0 to disable")
     parser.add_argument("--validation-report", type=str, default=None, help="Optional validation_report.json to include in generated report assets")
     parser.add_argument("--use-variants", action="store_true", help="Search multiple detrending variants; slower but more complete")
+    parser.add_argument("--mast-verbose", action="store_true", help="Show per-file astroquery/MAST download logs")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -67,7 +68,12 @@ def main() -> None:
         _, row = row_tuple
         tic_id = int(row["tic_id"])
         try:
-            paths = search_and_download_tess_lc(tic_id, sector=args.sector, download_dir=download_dir)
+            paths = search_and_download_tess_lc(
+                tic_id,
+                sector=args.sector,
+                download_dir=download_dir,
+                verbose=args.mast_verbose,
+            )
             return {"tic_id": tic_id, "paths": paths, "status": "ok" if paths else "no_lightcurve", "error": None}
         except Exception as exc:
             return {"tic_id": tic_id, "paths": [], "status": "download_failed", "error": repr(exc)}

@@ -192,7 +192,13 @@ def _process_row(row_idx: int, row: pd.Series, args, config: PipelineConfig, lig
             paths = _find_cached_lightcurves(tic_id, lightcurve_dir)
             if not paths:
                 try:
-                    paths = search_and_download_tess_lc(tic_id, sector=_sector_from_row(row), download_dir=lightcurve_dir)
+                    paths = search_and_download_tess_lc(
+                        tic_id,
+                        sector=_sector_from_row(row),
+                        download_dir=lightcurve_dir,
+                        max_products=args.max_lightcurves_per_target,
+                        verbose=args.mast_verbose,
+                    )
                 except Exception as exc:
                     return [], [{"source_row_index": row_idx, "tic_id": tic_id, "status": "download_failed", "error": repr(exc)}]
     if not paths:
@@ -255,7 +261,9 @@ def parse_args():
     parser.add_argument("--n-bootstrap", type=int, default=80)
     parser.add_argument("--n-workers", type=int, default=4, help="Concurrent row workers for MAST download/FITS feature building")
     parser.add_argument("--progress-every", type=int, default=1, help="Print progress every N completed rows")
+    parser.add_argument("--progress-style", choices=["bar", "lines", "none"], default="lines", help="Progress display style")
     parser.add_argument("--checkpoint-every", type=int, default=10, help="Rewrite partial output CSVs every N completed rows; use 0 to disable")
+    parser.add_argument("--mast-verbose", action="store_true", help="Show per-file astroquery/MAST download logs")
     return parser.parse_args()
 
 
@@ -334,6 +342,31 @@ def _progress_line(
     )
 
 
+def _progress_bar_text(
+    completed: int,
+    total: int,
+    feature_rows: list[dict[str, Any]],
+    manifest_rows: list[dict[str, Any]],
+    started: float,
+) -> str:
+    width = 28
+    pct = completed / max(total, 1)
+    filled = min(width, int(width * pct))
+    bar = "#" * filled + "." * (width - filled)
+    elapsed = max(time.monotonic() - started, 1e-6)
+    rate = completed / elapsed
+    eta = (total - completed) / rate if rate > 0 else None
+    counts = Counter(str(row.get("status", "unknown")) for row in manifest_rows)
+    status_text = ", ".join(f"{k}={v}" for k, v in counts.most_common(3)) or "none"
+    return (
+        f"[{bar}] {completed}/{total} {pct * 100.0:5.1f}% "
+        f"features={len(feature_rows)} "
+        f"rate={rate * 60.0:.2f} rows/min "
+        f"eta={_format_eta(eta)} "
+        f"statuses: {status_text}"
+    )
+
+
 def _run_rows(df: pd.DataFrame, args, config: PipelineConfig, lightcurve_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     row_items = list(df.iterrows())
     total = len(row_items)
@@ -350,12 +383,30 @@ def _run_rows(df: pd.DataFrame, args, config: PipelineConfig, lightcurve_dir: Pa
         flush=True,
     )
 
-    def handle_result(completed: int, rows: list[dict[str, Any]], manifest: list[dict[str, Any]]) -> None:
-        feature_rows.extend(rows)
-        manifest_rows.extend(manifest)
+    last_bar_len = 0
+
+    def emit_progress(completed: int) -> None:
+        nonlocal last_bar_len
+        if args.progress_style == "none":
+            return
+        if args.progress_style == "bar":
+            text = _progress_bar_text(completed, total, feature_rows, manifest_rows, started)
+            padding = " " * max(0, last_bar_len - len(text))
+            sys.stdout.write("\r" + text + padding)
+            sys.stdout.flush()
+            last_bar_len = len(text)
+            if completed == total:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            return
         should_print = completed == 1 or completed == total or completed % progress_every == 0
         if should_print:
             print(_progress_line(completed, total, feature_rows, manifest_rows, started), flush=True)
+
+    def handle_result(completed: int, rows: list[dict[str, Any]], manifest: list[dict[str, Any]]) -> None:
+        feature_rows.extend(rows)
+        manifest_rows.extend(manifest)
+        emit_progress(completed)
         if checkpoint_every and (completed % checkpoint_every == 0 or completed == total):
             _write_outputs(output_dir, args.output_csv, feature_rows, manifest_rows, total, complete=False)
 
