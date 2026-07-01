@@ -33,6 +33,8 @@ def main() -> None:
     parser.add_argument("--cnn-model", type=str, default=None, help="Optional CNN bundle directory or cnn_model.pt path")
     parser.add_argument("--n-workers", type=int, default=os.cpu_count() or 2, help="Number of parallel execution workers")
     parser.add_argument("--timeout-seconds", type=float, default=300.0, help="Per-FITS processing timeout; use 0 to disable")
+    parser.add_argument("--progress-style", choices=["bar", "lines", "none"], default="lines", help="Progress display style")
+    parser.add_argument("--progress-every", type=int, default=1, help="Print line progress every N completed targets")
     parser.add_argument("--validation-report", type=str, default=None, help="Optional validation_report.json to include in generated report assets")
     parser.add_argument("--no-variants", action="store_true", help="Disable searching across multiple detrending variants (speed up search by 4x)")
     args = parser.parse_args()
@@ -63,6 +65,8 @@ def main() -> None:
         max_targets=args.max_targets,
         n_workers=args.n_workers,
         timeout_seconds=None if args.timeout_seconds == 0 else args.timeout_seconds,
+        progress_style=args.progress_style,
+        progress_every=args.progress_every,
     )
     model_bundle = load_model_bundle(args.ai_model) if args.ai_model else None
     cnn_bundle = load_cnn_bundle(args.cnn_model) if args.cnn_model else None

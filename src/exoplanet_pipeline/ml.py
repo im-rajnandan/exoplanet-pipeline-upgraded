@@ -400,6 +400,17 @@ def train_ai_classifier(
     if len(y.unique()) < 2:
         raise ValueError("Need at least two classes to train a supervised classifier.")
 
+    observed_feature_columns = [c for c in feature_columns if X[c].notna().any()]
+    dropped_all_nan = [c for c in feature_columns if c not in observed_feature_columns]
+    if dropped_all_nan:
+        X = X[observed_feature_columns]
+        feature_columns = observed_feature_columns
+        preview = ", ".join(dropped_all_nan[:8])
+        suffix = "" if len(dropped_all_nan) <= 8 else f", ... (+{len(dropped_all_nan) - 8} more)"
+        warnings_list.append(f"Dropped all-NaN feature columns before training: {preview}{suffix}.")
+    if not feature_columns:
+        raise ValueError("No usable numeric feature columns with observed values found.")
+
     labels = [c for c in CANONICAL_CLASSES if c in set(y)]
     if not _can_stratify(y, test_size):
         warnings_list.append("Dataset too small or imbalanced for a stratified holdout; evaluation is in-sample only.")

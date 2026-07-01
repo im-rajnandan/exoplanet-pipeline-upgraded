@@ -42,6 +42,8 @@ def main() -> None:
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--n-workers", type=int, default=4, help="Number of parallel download/processing workers")
     parser.add_argument("--timeout-seconds", type=float, default=300.0, help="Per-FITS processing timeout; use 0 to disable")
+    parser.add_argument("--progress-style", choices=["bar", "lines", "none"], default="lines", help="Progress display style for FITS processing")
+    parser.add_argument("--progress-every", type=int, default=1, help="Print line progress every N completed FITS targets")
     parser.add_argument("--validation-report", type=str, default=None, help="Optional validation_report.json to include in generated report assets")
     parser.add_argument("--use-variants", action="store_true", help="Search multiple detrending variants; slower but more complete")
     parser.add_argument("--mast-verbose", action="store_true", help="Show per-file astroquery/MAST download logs")
@@ -128,6 +130,8 @@ def main() -> None:
         max_targets=None,
         n_workers=args.n_workers,
         timeout_seconds=None if args.timeout_seconds == 0 else args.timeout_seconds,
+        progress_style=args.progress_style,
+        progress_every=args.progress_every,
     )
     model_bundle = load_model_bundle(args.ai_model) if args.ai_model else None
     cnn_bundle = load_cnn_bundle(args.cnn_model) if args.cnn_model else None
