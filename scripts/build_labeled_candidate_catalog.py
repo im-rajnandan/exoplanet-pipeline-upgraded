@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+from collections import Counter
 import json
 from pathlib import Path
 import re
 import sys
+import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -32,6 +36,17 @@ EPOCH_COLUMNS = ("epoch_time", "epoch", "t0", "pl_tranmid", "koi_time0bk", "tce_
 DURATION_DAYS_COLUMNS = ("duration_days", "koi_duration_days", "tce_duration_days")
 DURATION_HOURS_COLUMNS = ("duration_hours", "duration_hrs", "pl_trandurh", "koi_duration", "tce_duration", "toi_duration")
 DEPTH_PPM_COLUMNS = ("depth_ppm", "depth", "pl_trandep", "koi_depth", "tce_depth", "toi_depth")
+_DOWNLOAD_LOCKS: dict[int, threading.Lock] = {}
+_DOWNLOAD_LOCKS_GUARD = threading.Lock()
+
+
+def _download_lock_for_tic(tic_id: int) -> threading.Lock:
+    with _DOWNLOAD_LOCKS_GUARD:
+        lock = _DOWNLOAD_LOCKS.get(tic_id)
+        if lock is None:
+            lock = threading.Lock()
+            _DOWNLOAD_LOCKS[tic_id] = lock
+        return lock
 
 
 def _row_get(row: pd.Series, columns: tuple[str, ...], default: Any = np.nan) -> Any:
@@ -173,10 +188,13 @@ def _process_row(row_idx: int, row: pd.Series, args, config: PipelineConfig, lig
     tic_id = int(tic)
     paths = _find_cached_lightcurves(tic_id, lightcurve_dir)
     if not paths and args.download_missing:
-        try:
-            paths = search_and_download_tess_lc(tic_id, sector=_sector_from_row(row), download_dir=lightcurve_dir)
-        except Exception as exc:
-            return [], [{"source_row_index": row_idx, "tic_id": tic_id, "status": "download_failed", "error": repr(exc)}]
+        with _download_lock_for_tic(tic_id):
+            paths = _find_cached_lightcurves(tic_id, lightcurve_dir)
+            if not paths:
+                try:
+                    paths = search_and_download_tess_lc(tic_id, sector=_sector_from_row(row), download_dir=lightcurve_dir)
+                except Exception as exc:
+                    return [], [{"source_row_index": row_idx, "tic_id": tic_id, "status": "download_failed", "error": repr(exc)}]
     if not paths:
         return [], [{"source_row_index": row_idx, "tic_id": tic_id, "status": "missing_lightcurve"}]
 
@@ -235,7 +253,132 @@ def parse_args():
     parser.add_argument("--quality-mask-mode", default="conservative", choices=["none", "minimal", "conservative", "strict"])
     parser.add_argument("--min-clean-points", type=int, default=500)
     parser.add_argument("--n-bootstrap", type=int, default=80)
+    parser.add_argument("--n-workers", type=int, default=4, help="Concurrent row workers for MAST download/FITS feature building")
+    parser.add_argument("--progress-every", type=int, default=1, help="Print progress every N completed rows")
+    parser.add_argument("--checkpoint-every", type=int, default=10, help="Rewrite partial output CSVs every N completed rows; use 0 to disable")
     return parser.parse_args()
+
+
+def _sort_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def key(row: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            row.get("source_row_index", 10**12),
+            row.get("tic_id", 10**12),
+            str(row.get("fits_path", "")),
+            row.get("candidate_id", 10**12),
+        )
+
+    return sorted(rows, key=key)
+
+
+def _write_outputs(
+    output_dir: Path,
+    output_csv: str,
+    feature_rows: list[dict[str, Any]],
+    manifest_rows: list[dict[str, Any]],
+    n_input_rows: int,
+    *,
+    complete: bool,
+) -> tuple[Path, Path, Path]:
+    features = pd.DataFrame(_sort_rows(feature_rows))
+    manifest = pd.DataFrame(_sort_rows(manifest_rows))
+    features_path = output_dir / output_csv
+    manifest_path = output_dir / "labeled_candidate_manifest.csv"
+    summary_path = output_dir / "labeled_candidate_summary.json"
+    features.to_csv(features_path, index=False)
+    manifest.to_csv(manifest_path, index=False)
+    summary = {
+        "complete": bool(complete),
+        "n_input_rows": int(n_input_rows),
+        "n_completed_source_rows": int(manifest["source_row_index"].nunique()) if "source_row_index" in manifest else 0,
+        "n_feature_rows": int(len(features)),
+        "status_counts": manifest["status"].value_counts(dropna=False).to_dict() if "status" in manifest else {},
+        "label_counts": features["label"].value_counts(dropna=False).to_dict() if "label" in features else {},
+    }
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return features_path, manifest_path, summary_path
+
+
+def _format_eta(seconds: float | None) -> str:
+    if seconds is None or not np.isfinite(seconds) or seconds < 0:
+        return "unknown"
+    seconds = int(seconds)
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _progress_line(
+    completed: int,
+    total: int,
+    feature_rows: list[dict[str, Any]],
+    manifest_rows: list[dict[str, Any]],
+    started: float,
+) -> str:
+    elapsed = max(time.monotonic() - started, 1e-6)
+    rate = completed / elapsed
+    eta = (total - completed) / rate if rate > 0 else None
+    counts = Counter(str(row.get("status", "unknown")) for row in manifest_rows)
+    status_text = ", ".join(f"{k}={v}" for k, v in counts.most_common(5)) or "none"
+    pct = 100.0 * completed / max(total, 1)
+    return (
+        f"[{completed}/{total} {pct:5.1f}%] "
+        f"features={len(feature_rows)} "
+        f"rate={rate * 60.0:.2f} rows/min "
+        f"eta={_format_eta(eta)} "
+        f"statuses: {status_text}"
+    )
+
+
+def _run_rows(df: pd.DataFrame, args, config: PipelineConfig, lightcurve_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    row_items = list(df.iterrows())
+    total = len(row_items)
+    feature_rows: list[dict[str, Any]] = []
+    manifest_rows: list[dict[str, Any]] = []
+    started = time.monotonic()
+    progress_every = max(1, int(args.progress_every))
+    checkpoint_every = max(0, int(args.checkpoint_every))
+    output_dir = Path(args.output_dir)
+
+    print(
+        f"Building labeled features for {total} rows with n_workers={args.n_workers}, "
+        f"download_missing={args.download_missing}, n_periods={args.n_periods}, n_bootstrap={args.n_bootstrap}",
+        flush=True,
+    )
+
+    def handle_result(completed: int, rows: list[dict[str, Any]], manifest: list[dict[str, Any]]) -> None:
+        feature_rows.extend(rows)
+        manifest_rows.extend(manifest)
+        should_print = completed == 1 or completed == total or completed % progress_every == 0
+        if should_print:
+            print(_progress_line(completed, total, feature_rows, manifest_rows, started), flush=True)
+        if checkpoint_every and (completed % checkpoint_every == 0 or completed == total):
+            _write_outputs(output_dir, args.output_csv, feature_rows, manifest_rows, total, complete=False)
+
+    if args.n_workers <= 1:
+        for completed, (row_idx, row) in enumerate(row_items, 1):
+            rows, manifest = _process_row(row_idx, row, args, config, lightcurve_dir)
+            handle_result(completed, rows, manifest)
+        return feature_rows, manifest_rows
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(args.n_workers))) as executor:
+        future_to_row = {
+            executor.submit(_process_row, row_idx, row, args, config, lightcurve_dir): int(row_idx)
+            for row_idx, row in row_items
+        }
+        for completed, fut in enumerate(concurrent.futures.as_completed(future_to_row), 1):
+            row_idx = future_to_row[fut]
+            try:
+                rows, manifest = fut.result()
+            except Exception as exc:
+                rows = []
+                manifest = [{"source_row_index": row_idx, "status": "worker_failed", "error": repr(exc)}]
+            handle_result(completed, rows, manifest)
+    return feature_rows, manifest_rows
 
 
 def main():
@@ -259,30 +402,17 @@ def main():
         make_plots=False,
     )
 
-    feature_rows: list[dict[str, Any]] = []
-    manifest_rows: list[dict[str, Any]] = []
-    for row_idx, row in df.iterrows():
-        rows, manifest = _process_row(row_idx, row, args, config, lightcurve_dir)
-        feature_rows.extend(rows)
-        manifest_rows.extend(manifest)
-        if (row_idx + 1) % 10 == 0 or (row_idx + 1) == len(df):
-            print(f"[{row_idx + 1}/{len(df)}] feature rows: {len(feature_rows)}", flush=True)
-
-    features = pd.DataFrame(feature_rows)
-    manifest = pd.DataFrame(manifest_rows)
-    features_path = output_dir / args.output_csv
-    manifest_path = output_dir / "labeled_candidate_manifest.csv"
-    summary_path = output_dir / "labeled_candidate_summary.json"
-    features.to_csv(features_path, index=False)
-    manifest.to_csv(manifest_path, index=False)
-    summary = {
-        "n_input_rows": int(len(df)),
-        "n_feature_rows": int(len(features)),
-        "status_counts": manifest["status"].value_counts(dropna=False).to_dict() if "status" in manifest else {},
-        "label_counts": features["label"].value_counts(dropna=False).to_dict() if "label" in features else {},
-    }
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print(json.dumps(summary, indent=2))
+    feature_rows, manifest_rows = _run_rows(df, args, config, lightcurve_dir)
+    features_path, manifest_path, summary_path = _write_outputs(
+        output_dir,
+        args.output_csv,
+        feature_rows,
+        manifest_rows,
+        len(df),
+        complete=True,
+    )
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    print(json.dumps(summary, indent=2), flush=True)
     print(f"features: {features_path}")
     print(f"manifest: {manifest_path}")
 
